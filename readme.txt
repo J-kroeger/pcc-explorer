@@ -22,15 +22,6 @@ If you use this software, please cite:
 ================================================================================
   QUICK START
 ================================================================================
-
-Running the Executable (Windows)
---------------------------------
-  1. Double-click PCC-Explorer.exe
-  2. The GUI will open -- load ANTEX files, configure settings, and run
-     your analysis
-
-Running from Source
--------------------
   pip install -r requirements.txt
   python -m src.main_gui
 
@@ -241,7 +232,6 @@ Example:
 ================================================================================
 
   PCC-Explorer/
-  +-- PCC-Explorer.exe         Main executable
   +-- data/
   |   +-- antex/               ANTEX calibration files
   |   +-- orbit/               Downloaded orbit files (auto-populated)

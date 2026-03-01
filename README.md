@@ -9,8 +9,6 @@ PCC-Explorer allows researchers and practitioners to analyze how differences in 
 ## Table of Contents
 - [Citation](#citation)
 - [Quick Start](#quick-start)
-  - [Executable (Windows)](#running-the-executable-windows)
-  - [From source](#running-from-source)
 - [Features & GUI Overview](#features--gui-overview)
   - [Selection of the ANTEX‑Files](#selection-of-the-antex-files)
   - [Antenna Type](#antenna-type)
@@ -43,13 +41,6 @@ If you use this software, please cite:
 ---
 
 ## Quick Start
-
-### Running the Executable (Windows)
-
-1. Double-click `PCC-Explorer.exe`
-2. The GUI will open — load ANTEX files, configure settings, and run your analysis
-
-### Running from Source
 
 ```bash
 pip install -r requirements.txt
@@ -228,7 +219,6 @@ python -m src.main_cli configs/Analysis_LEIAR25.R4______LEIT_725058_config_20260
 
 ```
 PCC-Explorer/
-├── PCC-Explorer.exe         # Main executable
 ├── data/
 │   ├── antex/               # ANTEX calibration files
 │   └── orbit/               # Downloaded orbit files (auto-populated)
