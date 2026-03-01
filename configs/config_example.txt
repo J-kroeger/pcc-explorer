@@ -1,0 +1,39 @@
+# ============================================
+# PCC-Explorer Configuration File (Example)
+# Created: 2026-02-25
+# ============================================
+
+# --- Analysis Mode ---
+analysis_mode=two_files
+
+# --- ANTEX Files ---
+antex_file_1=data/antex/LEIAR25R4_LEIT_725058_CHAMBER_BONN_20190118.atx
+antex_file_2=data/antex/LEIAR25R4_LEIT_725058_ROBOT_GEO_20110708.atx
+antenna_type=LEIAR25.R4      LEIT 725058
+
+# --- Date/Time Settings ---
+start_date=2023-04-01
+start_time=00:00
+end_date=2023-04-01
+end_time=23:59
+sampling_rate_sec=30
+interval_min=1440
+
+# --- Processing Options ---
+orbit_type=final
+weighting=sin
+tropo_model=GMF
+signals=G01
+gradient_active=False
+
+# --- Position ---
+position_type=Ellipsoidal
+latitude=54.8083
+longitude=8.2917
+height=50.0
+
+# --- Orbit Directory ---
+orbit_dir=data/orbit
+
+# --- Elevation Mask ---
+elevation_mask=7
