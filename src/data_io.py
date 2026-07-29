@@ -83,16 +83,111 @@ def _download_with_requests(url: str, save_path: str):
                 f.write(chunk)
 
 # ----------------------------
+# Anonymous orbit sources (no login) — used before CDDIS
+# ----------------------------
+
+def _http_get_anon(url: str, save_path: str, timeout: int = 90):
+    """Anonymous HTTP(S) download (no credentials). Raises on any failure."""
+    headers = {'User-Agent': 'PCC-Explorer'}
+    with requests.get(url, stream=True, headers=headers, timeout=timeout) as r:
+        r.raise_for_status()
+        if 'text/html' in r.headers.get('Content-Type', ''):
+            raise ConnectionError(f"Server returned HTML, not a file: {url}")
+        with open(save_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                f.write(chunk)
+
+
+def _decompress_gz(local_compressed: str, local_final: str):
+    """gunzip local_compressed -> local_final; returns local_final or None."""
+    with gzip.open(local_compressed, 'rb') as f_in, open(local_final, 'wb') as f_out:
+        shutil.copyfileobj(f_in, f_out)
+    os.remove(local_compressed)
+    return local_final if os.path.exists(local_final) else None
+
+
+def _download_from_aiub_http(dt_obj: datetime, download_dir: str) -> str:
+    """
+    CODE MGEX final orbit via AIUB's new HTTP endpoint (anonymous, no login).
+    AIUB moved off FTP in 2026; products now live at
+    http://www.aiub.unibe.ch/download/CODE_MGEX/CODE/<year>/<file>
+    """
+    year_full = dt_obj.strftime('%Y')
+    day_of_year = dt_obj.strftime('%j')
+    fn = f"COD0MGXFIN_{year_full}{day_of_year}0000_01D_05M_ORB.SP3.gz"
+    url = f"http://www.aiub.unibe.ch/download/CODE_MGEX/CODE/{year_full}/{fn}"
+    local_c = os.path.join(download_dir, fn)
+    local_f = os.path.join(download_dir, fn[:-3])
+    print(f"\nAttempting AIUB HTTP: {url}")
+    try:
+        _http_get_anon(url, local_c)
+        return _decompress_gz(local_c, local_f)
+    except Exception as e:
+        print(f"  AIUB HTTP failed: {e}")
+        if os.path.exists(local_c):
+            os.remove(local_c)
+        return None
+
+
+def _download_from_ign_ftp(dt_obj: datetime, download_dir: str) -> str:
+    """
+    Multi-GNSS finals then rapid via IGN's anonymous IGS mirror
+    (igs.ign.fr:/pub/igs/products/<week>/). No login. First file found wins.
+    """
+    year_full = dt_obj.strftime('%Y')
+    day_of_year = dt_obj.strftime('%j')
+    mjd_val = datetime_to_mjd(dt_obj)
+    gps_week, _dow = mjd_to_gps_week(mjd_val)
+    remote_dir = f"/pub/igs/products/{gps_week}"
+
+    def _fn(ac, camp):
+        return f"{ac}0{camp}_{year_full}{day_of_year}0000_01D_05M_ORB.SP3.gz"
+
+    files = [_fn('COD', 'MGXFIN'), _fn('GRG', 'MGXFIN'),
+             _fn('WUM', 'MGXFIN'), _fn('GFZ', 'MGXRAP')]
+    print(f"\nAttempting IGN FTP (igs.ign.fr{remote_dir})...")
+    ftp = None
+    try:
+        ftp = FTP('igs.ign.fr', timeout=30)
+        ftp.login()  # anonymous
+        ftp.cwd(remote_dir)
+        for fn in files:
+            local_c = os.path.join(download_dir, fn)
+            local_f = os.path.join(download_dir, fn[:-3])
+            try:
+                print(f"  Trying: {fn}...")
+                with open(local_c, 'wb') as f:
+                    ftp.retrbinary(f"RETR {fn}", f.write)
+            except Exception:
+                if os.path.exists(local_c):
+                    os.remove(local_c)
+                continue
+            ftp.quit()
+            ftp = None
+            return _decompress_gz(local_c, local_f)
+    except Exception as e:
+        print(f"  IGN FTP failed: {e}")
+    finally:
+        if ftp:
+            try:
+                ftp.quit()
+            except Exception:
+                pass
+    return None
+
+
+# ----------------------------
 # AIUB/CODE Helpers (FTP)
 # ----------------------------
 
 def _download_from_aiub_ftp(dt_obj: datetime, download_dir: str) -> str:
     """
-    Downloads final orbit files from the AIUB FTP server (CODE products).
-    Tries multiple file patterns and directories based on AIUB FTP structure.
-    No login required (anonymous FTP).
+    DEPRECATED shim. AIUB shut down anonymous FTP and moved CODE products to HTTP
+    (2026-07); this now delegates to _download_from_aiub_http(). The old FTP code
+    below is unreachable and kept only for reference.
     """
-    ftp_host = 'ftp.aiub.unibe.ch'
+    return _download_from_aiub_http(dt_obj, download_dir)
+    ftp_host = 'ftp.aiub.unibe.ch'  # noqa - unreachable, legacy FTP path
     
     # Time conversions
     mjd_val = datetime_to_mjd(dt_obj)
@@ -217,6 +312,14 @@ def download_and_unzip_broadcast_file(dt_obj: datetime, download_dir: str) -> st
     bkg_targets = []
 
     if year_int >= 2016:
+        # Current BKG location (2026-07): broadcast nav moved from /MGEX/BRDC/,
+        # which now lags, to /IGS/BRDC/. Try the live location + current names
+        # first; the older /MGEX/BRDC/ paths below stay as a fallback.
+        igs_dir = f"IGS/BRDC/{year_full}/{day_of_year}"
+        bkg_targets.append((f"BRDC00IGS_R_{year_full}{day_of_year}0000_01D_MN.rnx.gz", igs_dir))
+        bkg_targets.append((f"BRDM00DLR_S_{year_full}{day_of_year}0000_01D_MN.rnx.gz", igs_dir))
+        bkg_targets.append((f"BRDC00WRD_R_{year_full}{day_of_year}0000_01D_MN.rnx.gz", igs_dir))
+
         # Long filename format (MGEX/BRDC/)
         bkg_dir = f"MGEX/BRDC/{year_full}/{day_of_year}"
         # Pattern 1: BRDC00WRD (current standard on BKG)
@@ -329,11 +432,24 @@ def download_final_orbit_file(dt_obj: datetime, download_dir: str) -> str:
     """
     os.makedirs(download_dir, exist_ok=True)
 
-    # --- Priority 1: AIUB FTP ---
-    # This mirrors the logic in getFO.m
-    result_path = _download_from_aiub_ftp(dt_obj, download_dir)
-    if result_path and os.path.exists(result_path):
-        return result_path
+    # --- Cache: reuse any known product already downloaded for this day ---
+    _yf = dt_obj.strftime('%Y'); _doy = dt_obj.strftime('%j')
+    for _p in (f"COD0MGXFIN_{_yf}{_doy}0000_01D_05M_ORB.SP3",
+               f"GRG0MGXFIN_{_yf}{_doy}0000_01D_05M_ORB.SP3",
+               f"WUM0MGXFIN_{_yf}{_doy}0000_01D_05M_ORB.SP3",
+               f"GFZ0MGXRAP_{_yf}{_doy}0000_01D_05M_ORB.SP3"):
+        _lf = os.path.join(download_dir, _p)
+        if os.path.exists(_lf):
+            print(f"Using existing final orbit file: {_lf}")
+            return _lf
+
+    # --- Priority 1: anonymous sources, no login (fallback chain) ---
+    #   AIUB moved to HTTP (2026-07); IGN is a login-free IGS mirror. Trying
+    #   several sources in turn means no single server going down breaks it.
+    for _src in (_download_from_aiub_http, _download_from_ign_ftp):
+        result_path = _src(dt_obj, download_dir)
+        if result_path and os.path.exists(result_path):
+            return result_path
         
     print("Falling back to NASA CDDIS (requires _netrc)...")
 

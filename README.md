@@ -95,10 +95,14 @@ Configure the observation period:
 
 Select the GNSS orbit source:
 
-- **Broadcast Ephemeris:** Uses broadcast navigation data made available by BKG (Bundesamt für Kartographie und Geodäsie). If BKG data is unavailable, the software falls back to NASA JPL/CDDIS. Note: NASA CDDIS requires login credentials stored in a `_netrc` file (see below).
-- **Final Orbits (Precise):** Uses precise orbit products from CODE (Center for Orbit Determination in Europe), with a fallback to NASA JPL/CDDIS. These are more accurate but have a ~21-day delay. Orbits are downloaded automatically to the `data/orbit/` folder.
+Both options download automatically, trying **several public sources in turn** so that no single server being moved, empty, or busy can break the download:
 
-**NASA CDDIS Credentials (required for fallback):**
+- **Broadcast Ephemeris:** multi-GNSS broadcast navigation data from BKG (Bundesamt für Kartographie und Geodäsie), then NASA JPL/CDDIS as a last resort.
+- **Final Orbits (Precise):** multi-GNSS precise orbits from CODE, tried in this order — **AIUB** (`http://www.aiub.unibe.ch/download/CODE_MGEX/CODE/`, no login), then **IGN** (`igs.ign.fr`, no login), then **NASA CDDIS** (login required, used only if the first two fail). Final products are the most accurate but have a delay of a few days to ~2–3 weeks; orbits are downloaded automatically to the `data/orbit/` folder.
+
+Because the login-free sources (AIUB and IGN) are tried first, a NASA Earthdata login is **no longer required for normal use** — CDDIS is only a last-resort fallback.
+
+**NASA CDDIS Credentials (optional last-resort fallback):**
 To enable NASA CDDIS as a fallback orbit source, create a file named `_netrc` (Windows) or `.netrc` (Linux/macOS) in your home directory with the following content:
 ```
 machine urs.earthdata.nasa.gov
@@ -243,4 +247,4 @@ See LICENSE and LICENSE.txt
 
 ## Acknowledgements
 
-We thank the Center for Orbit Determination in Europe (CODE) for providing high-quality GNSS orbit products, the Federal Agency for Cartography and Geodesy (BKG) for providing publicly accessible broadcast ephemeris data, and NASA JPL/CDDIS for providing publicly accessible GNSS data as a fallback source.
+We thank the Center for Orbit Determination in Europe (CODE) for providing high-quality GNSS orbit products, AIUB (University of Bern) and IGN (Institut national de l'information géographique et forestière) for hosting them for public download, the Federal Agency for Cartography and Geodesy (BKG) for providing publicly accessible broadcast ephemeris data, and NASA JPL/CDDIS for providing publicly accessible GNSS data as a fallback source.
