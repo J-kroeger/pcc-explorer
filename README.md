@@ -36,7 +36,7 @@ PCC-Explorer allows researchers and practitioners to analyze how differences in 
 
 If you use this software, please cite:
 
-> Kröger J., Kersten T., Schön S. (2026) PCC-Explorer: An open-source software tool to assess the impact of GNSS antenna phase center corrections on geodetic parameters. GPS Solutions (accepted)
+> Kröger J., Kersten T., Schön S. (2026) PCC-Explorer: An open-source software tool to assess the impact of GNSS antenna phase center corrections on geodetic parameters. GPS Solutions. <https://doi.org/10.1007/s10291-026-02056-2>
 
 ---
 

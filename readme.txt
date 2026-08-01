@@ -15,9 +15,10 @@ such as coordinates and tropospheric delays.
 
 If you use this software, please cite:
 
-  Kroeger J., Kersten T., Schoen S. (2026) PCC-Explorer: An open-source
+  Kröger J., Kersten T., Schön S. (2026) PCC-Explorer: An open-source
   software tool to assess the impact of GNSS antenna phase center corrections
-  on geodetic parameters. GPS Solutions (accepted)
+  on geodetic parameters. GPS Solutions.
+  https://doi.org/10.1007/s10291-026-02056-2
 
 ================================================================================
   QUICK START
@@ -94,7 +95,7 @@ Select the GNSS orbit source:
   turn so that no single server being moved, empty, or busy breaks it:
 
   * Broadcast Ephemeris: multi-GNSS broadcast navigation data from BKG
-    (Bundesamt fuer Kartographie und Geodaesie), then NASA JPL/CDDIS as a
+    (Bundesamt für Kartographie und Geodäsie), then NASA JPL/CDDIS as a
     last resort.
   * Final Orbits (Precise): multi-GNSS precise orbits from CODE, tried in
     this order - AIUB (http://www.aiub.unibe.ch/download/CODE_MGEX/CODE/,
@@ -253,7 +254,7 @@ Example:
   CONTACT
 ================================================================================
 
-  Dr.-Ing. Johannes Kroeger -- kroeger@ife.uni-hannover.de
+  Dr.-Ing. Johannes Kröger -- kroeger@ife.uni-hannover.de
 
 ================================================================================
   LICENSE
@@ -268,7 +269,7 @@ See LICENSE and LICENSE.txt
 
 We thank the Center for Orbit Determination in Europe (CODE) for providing
 high-quality GNSS orbit products, AIUB (University of Bern) and IGN (Institut
-national de l'information geographique et forestiere) for hosting them for
+national de l'information géographique et forestière) for hosting them for
 public download, the Federal Agency for Cartography and Geodesy (BKG) for
 providing publicly accessible broadcast ephemeris data, and NASA JPL/CDDIS
 for providing publicly accessible GNSS data as a fallback source.
