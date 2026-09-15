@@ -116,6 +116,10 @@ def compute_m_matrix(config: dict) -> tuple:
     el_mask_angle = config.get('elevation_mask_angle', 0.0) if el_mask_active else 0.0
     az_mask_active = config.get('azimuth_mask_active', False)
     az_mask_values = config.get('azimuth_mask_values', [])
+    # Azimuth-dependent horizon imported from RINEX-Masker. Combined with the
+    # flat cutoff above as a maximum, so the stricter of the two always wins.
+    obstruction_mask = config.get('obstruction_mask_obj')
+    obstruction_blocked = 0
     
     signals_to_process = config.get('signals', [])
     systems_to_process = set()
@@ -205,6 +209,10 @@ def compute_m_matrix(config: dict) -> tuple:
                             azimuth_masked_out = True; break
                 if azimuth_masked_out: continue
 
+                if obstruction_mask is not None and obstruction_mask.is_obstructed(azimuth_deg, elevation_deg):
+                    obstruction_blocked += 1
+                    continue
+
                 if elevation_deg >= 0:
                      all_valid_azimuths.append(azimuth_deg % 360.0)
                      all_valid_elevations.append(elevation_deg)
@@ -212,6 +220,14 @@ def compute_m_matrix(config: dict) -> tuple:
 
         if sampling_rate.total_seconds() <= 0: break
         current_time += sampling_rate
+
+    if obstruction_mask is not None:
+        # Report the count: a flat cut-off can hide most of a mask's effect, so
+        # the number removed by the horizon itself is what makes the run
+        # interpretable.
+        kept = len(all_valid_azimuths)
+        print(f"  Obstruction mask: {obstruction_blocked} directions blocked, {kept} kept "
+              f"({obstruction_mask.summary()})")
 
     if not all_valid_azimuths:
          print("  Warning: No valid observations found. Cannot compute P2 matrix. Returning None.")
@@ -289,11 +305,31 @@ def _create_A_grids(grid_shape, grid_step, tropo_model, config):
              # GMF (simplified/inline)
              a = 2.53e-5; b = 5.49e-3; c = 1.14e-3
              den_c = sin_el_safe + c
-             den_b = sin_el_safe + b / (den_c + 1e-9) 
+             den_b = sin_el_safe + b / (den_c + 1e-9)
              den_a = sin_el_safe + a / (den_b + 1e-9)
              num_a = 1.0 + a / (1.0 + b / (1.0 + c))
              A_Tropo_grid = num_a / (den_a + 1e-9)
-        else: 
+        elif tropo_model in ('VMF', 'VMF1'):
+             # Gridded TU Wien VMF1 wet mapping. The grid-interpolated wet
+             # coefficient aw is precomputed for the station/epoch and passed in
+             # config['vmf_aw']; the wet b/c are constants (Boehm et al., 2006,
+             # mirrored in src/vmf.py). Falls back to GMF if aw is unavailable.
+             aw = config.get('vmf_aw')
+             if aw is None:
+                  a = 2.53e-5; b = 5.49e-3; c = 1.14e-3
+                  den_c = sin_el_safe + c
+                  den_b = sin_el_safe + b / (den_c + 1e-9)
+                  den_a = sin_el_safe + a / (den_b + 1e-9)
+                  num_a = 1.0 + a / (1.0 + b / (1.0 + c))
+                  A_Tropo_grid = num_a / (den_a + 1e-9)
+             else:
+                  bw = 0.00146; cw = 0.04391  # VMF1 wet constants
+                  den_c = sin_el_safe + cw
+                  den_b = sin_el_safe + bw / (den_c + 1e-9)
+                  den_a = sin_el_safe + aw / (den_b + 1e-9)
+                  num_a = 1.0 + aw / (1.0 + bw / (1.0 + cw))
+                  A_Tropo_grid = num_a / (den_a + 1e-9)
+        else:
              A_Tropo_grid = 1.0 / sin_el_safe
         
         # Troposphere gradient matrices: Chen & Herring (1997)
@@ -600,34 +636,34 @@ def perform_adjustment(config: dict, antex_data_1: dict, antex_data_2: dict,
             signals_processed_count += 1
 
         except Exception as e:
-            print(f"  ⚠️ WARNING: Failed to process signal {signal}. Skipping. Error: {e}")
+            print(f"  [WARNING] Failed to process signal {signal}. Skipping. Error: {e}")
             import traceback
             traceback.print_exc()
             
     if signals_processed_count == 0:
-        print("\n  ❌ ERROR: No signals could be processed. Adjustment failed.")
+        print("\n  [ERROR] No signals could be processed. Adjustment failed.")
         return None, param_names, m_matrix, None, None
         
     # --- 5. Solve Normal Equations ---
     try:
          cond_N = np.linalg.cond(N_bar_total); 
          if np.any(np.abs(np.diag(N_bar_total)) < 1e-12):
-             print("  ❌ ERROR: Near-zero diagonal elements found in N_bar_total. Singular.")
+             print("  [ERROR] Near-zero diagonal elements found in N_bar_total. Singular.")
              return None, param_names, m_matrix, None, None
 
          results_vec = np.linalg.solve(N_bar_total, n_bar_total)
          
     except np.linalg.LinAlgError: 
-        print("  ❌ ERROR: Normal matrix N_bar_total is singular. Cannot solve.")
+        print("  [ERROR] Normal matrix N_bar_total is singular. Cannot solve.")
         return None, param_names, m_matrix, None, None
     except Exception as e: 
-        print(f"  ❌ ERROR solving linear system: {e}")
+        print(f"  [ERROR] solving linear system: {e}")
         return None, param_names, m_matrix, None, None
 
     end_adj_time = time.time()
     
     if np.isnan(results_vec).any():
-        print("\n❌ PROCESSING FAILED: Final mapped results contain NaN values.")
+        print("\n[ERROR] PROCESSING FAILED: Final mapped results contain NaN values.")
         return None, param_names, m_matrix, None, None
     
     return results_vec, param_names, m_matrix, None, None

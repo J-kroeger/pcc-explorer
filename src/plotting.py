@@ -7,9 +7,55 @@ for GNSS antenna PCC impact analysis results.
 
 import matplotlib.pyplot as plt
 import numpy as np
+import threading
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+from cartopy.io.img_tiles import GoogleTiles as _ImgTilesBase
 from .orbit_utils import get_ground_tracks, validate_orbit_data
+
+
+def _main_thread_only(what: str) -> bool:
+    """
+    Guard against building a figure from a background thread.
+
+    A figure created off the main thread gets a Tk figure manager owned by a
+    thread that usually dies straight afterwards. Nothing fails at that moment;
+    the *next* plt.show() on the main thread walks every open manager, reaches
+    the orphan and raises "RuntimeError: main thread is not in main loop" —
+    three frames and one thread away from the real mistake.
+
+    Returns True when it is safe to draw. Callers that get False must hand the
+    request to the GUI instead (see processing_core's '_pending_plots').
+    """
+    if threading.current_thread() is threading.main_thread():
+        return True
+    print(f"  Warning: refusing to draw the {what} from a background thread - "
+          f"it would break the next plot window. Draw it from the GUI "
+          f"completion callback instead.")
+    return False
+
+
+def cap_major_ticks(ax, max_ticks=12):
+    """
+    Keep at most `max_ticks` labelled ticks on the x axis of `ax`.
+
+    With one solution per epoch, a long or high-rate run asks for far more tick
+    labels than the axis can fit, and they overprint into an unreadable band.
+    Rather than switch to a coarser time unit, which changes what the axis
+    means, every Nth tick the locator produced is kept, so the spacing stays
+    regular and the format stays the same.
+
+    Returns the number of ticks left, so a caller can report what it did.
+    """
+    import math
+    from matplotlib.ticker import FixedLocator
+    ticks = list(ax.get_xticks())
+    if len(ticks) <= max_ticks:
+        return len(ticks)
+    step = int(math.ceil(len(ticks) / float(max_ticks)))
+    kept = ticks[::step]
+    ax.xaxis.set_major_locator(FixedLocator(kept))
+    return len(kept)
 
 
 def plot_timeline(dates: list, results_matrix: np.ndarray, param_names: list, colors: list = None, 
@@ -28,6 +74,8 @@ def plot_timeline(dates: list, results_matrix: np.ndarray, param_names: list, co
         station_coords: Optional tuple of (latitude, longitude, height) for display
         antenna_name: Optional antenna name for display
     """
+    if not _main_thread_only('time series'):
+        return
     import matplotlib.dates as mdates
     from datetime import datetime, timedelta
     
@@ -162,6 +210,8 @@ def plot_timeline(dates: list, results_matrix: np.ndarray, param_names: list, co
             axes[-1].xaxis.set_major_locator(mdates.YearLocator())
             axes[-1].xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
     
+    cap_major_ticks(axes[-1], max_ticks=15)
+
     # Rotate labels for readability
     plt.setp(axes[-1].xaxis.get_majorticklabels(), rotation=45, ha='right')
     
@@ -179,6 +229,8 @@ def plot_results_bar_chart(param_names: list, results: np.ndarray, colors: list 
         colors: Optional list of colors to use for bars
         title: Optional custom title for the plot
     """
+    if not _main_thread_only('results bar chart'):
+        return
     if len(param_names) == 0 or len(results) == 0:
         print("Warning: No results to plot")
         return
@@ -270,6 +322,8 @@ def plot_world_map(lons: np.ndarray, lats: np.ndarray, data_grid: np.ndarray,
         colorbar_limits: Optional tuple (vmin, vmax) for colorbar scaling.
                         If None, uses auto-scaling based on data.
     """
+    if not _main_thread_only('world map'):
+        return
     fig = plt.figure(figsize=(15, 8))
     ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
     
@@ -331,6 +385,8 @@ def plot_skyplot(azimuths: list, elevations: list, m_matrix: np.ndarray = None, 
         height: Optional height in meters for title
         satellite_ids: Optional list of satellite IDs (e.g., 'G01', 'E05') for each observation
     """
+    if not _main_thread_only('skyplot'):
+        return
     if not azimuths or not elevations:
         print("Warning: No satellite positions to plot")
         return
@@ -467,3 +523,403 @@ def plot_skyplot(azimuths: list, elevations: list, m_matrix: np.ndarray = None, 
     # adjust layout to make room for text on the right
     plt.subplots_adjust(right=0.8)
     plt.show()
+
+
+def plot_los_timeline(epoch_results: list, param_names: list, colors: list = None,
+                      y_axis_mode: str = "Auto", title: str = None):
+    """
+    Plots per-epoch LoS adjustment results as a time series with actual UTC timestamps.
+
+    Each parameter gets its own subplot panel with the epoch datetime on the x-axis,
+    so every value is shown at its exact timestamp.
+
+    Args:
+        epoch_results: List of (epoch_dt, results_vec, n_sats) tuples from
+                       perform_los_adjustment().
+        param_names: List of parameter names (e.g., ['North', 'East', 'Up', 'Clock_GPS']).
+        colors: Optional list of colors for each parameter.
+        y_axis_mode: "Auto" (default) or "Symmetric" (centered on 0).
+        title: Optional overall title.
+    """
+    if not _main_thread_only('LoS time series'):
+        return
+    if not epoch_results:
+        print("No per-epoch results to plot.")
+        return
+
+    import matplotlib.dates as mdates
+    from matplotlib.ticker import AutoMinorLocator
+
+    # Display name mapping
+    PARAM_DISPLAY = {
+        'North': 'North [mm]', 'East': 'East [mm]', 'Up': 'Up [mm]',
+        'Clock_GPS': 'Clock GPS [mm]', 'Clock_GLONASS': 'Clock GLO [mm]',
+        'Clock_Galileo': 'Clock GAL [mm]', 'Clock_BDS': 'Clock BDS [mm]',
+        'Tropo': 'Tropo [mm]', 'Tropo_Gn': 'Tropo Gn [mm]', 'Tropo_Ge': 'Tropo Ge [mm]'
+    }
+
+    # Extract timestamps and result vectors
+    timestamps = [ep[0] for ep in epoch_results]
+    results_matrix = np.array([ep[1] for ep in epoch_results])
+    n_sats_list = [ep[2] for ep in epoch_results]
+    n_params = len(param_names)
+
+    # Default colors
+    if colors is None:
+        colors = ['#2196F3', '#4CAF50', '#FF5722', '#9C27B0',
+                  '#FF9800', '#009688', '#E91E63', '#795548']
+
+    # Determine time span for adaptive x-axis formatting
+    if len(timestamps) > 1:
+        time_span = (timestamps[-1] - timestamps[0]).total_seconds()
+    else:
+        time_span = 0
+
+    # 2.5 in per panel made a 12 x 12.5 in figure for five
+    # parameters, taller than most screens. Shrink that into a smaller window
+    # and the fonts, which are fixed in POINTS, swamp the canvas: the y labels
+    # ride over the panels and the x axis label is squeezed off the bottom
+    # entirely. Cap the height, and let constrained_layout do the spacing.
+    #
+    # constrained_layout rather than tight_layout because it re-runs on EVERY
+    # draw. tight_layout runs once at creation, so a window the user resizes
+    # afterwards would keep the spacing computed for the original size.
+    fig_h = min(2.5 * n_params, 9.0)
+    fig, axes = plt.subplots(n_params, 1, figsize=(12, fig_h),
+                             sharex=True, constrained_layout=True)
+    if n_params == 1:
+        axes = [axes]
+
+    for i, (ax, pname) in enumerate(zip(axes, param_names)):
+        color = colors[i % len(colors)]
+        display_name = PARAM_DISPLAY.get(pname, pname)
+        values = results_matrix[:, i]
+
+        ax.plot(timestamps, values, '-o', color=color, linewidth=1.5,
+                markersize=3, alpha=0.8, label=display_name)
+        ax.axhline(y=0, color='gray', linewidth=0.5, alpha=0.5, linestyle='--')
+
+        ax.set_ylabel(display_name, fontsize=10, fontweight='bold')
+        ax.yaxis.set_minor_locator(AutoMinorLocator())
+        ax.grid(True, which='major', linewidth=0.5, alpha=0.4)
+        ax.grid(True, which='minor', linewidth=0.3, alpha=0.2)
+
+        if y_axis_mode == "Symmetric":
+            max_abs = max(abs(values.min()), abs(values.max()), 0.1)
+            ax.set_ylim(-max_abs * 1.1, max_abs * 1.1)
+
+    # X-axis formatting (adaptive based on time span)
+    ax_bottom = axes[-1]
+    if time_span < 7200:  # < 2 hours
+        ax_bottom.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+        ax_bottom.xaxis.set_major_locator(mdates.MinuteLocator(interval=max(1, int(time_span / 600))))
+    elif time_span < 86400:  # < 1 day
+        ax_bottom.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+        ax_bottom.xaxis.set_major_locator(mdates.HourLocator(interval=max(1, int(time_span / 28800))))
+    else:  # multi-day
+        ax_bottom.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d\n%H:%M'))
+        ax_bottom.xaxis.set_major_locator(mdates.AutoDateLocator())
+
+    # None of the branches above bounds the tick count: a high-rate or long run
+    # can produce hundreds of labels that overprint into a solid band.
+    cap_major_ticks(ax_bottom)
+
+    ax_bottom.set_xlabel('UTC Time', fontsize=11, fontweight='bold')
+    # Rotate by hand: fig.autofmt_xdate() calls subplots_adjust, which fights
+    # constrained_layout and makes matplotlib drop the managed layout.
+    for _lbl in ax_bottom.get_xticklabels():
+        _lbl.set_rotation(30)
+        _lbl.set_ha('right')
+
+    # Title
+    # On the line-of-sight time series both the title and the x axis label
+    # could be cropped, and both came from the same two lines. y=1.01 puts the suptitle ABOVE the top edge of the canvas
+    # (figure coordinates run 0 to 1), and the tight_layout() below then packs
+    # the axes to fill the whole figure without reserving any room for it, so
+    # the title was drawn off the paper and the rotated date labels pushed the
+    # x-axis label off the bottom. Keep the title inside the canvas and hand
+    # tight_layout an explicit rect that leaves a strip for it.
+    if not title:
+        t0 = timestamps[0].strftime('%Y-%m-%d %H:%M')
+        t1 = timestamps[-1].strftime('%H:%M:%S')
+        title = (f'LoS Per-Epoch Results ({t0} - {t1}, '
+                 f'{len(epoch_results)} epochs)')
+    # constrained_layout reserves room for the suptitle itself, so no manual
+    # y offset and no tight_layout rect are needed.
+    fig.suptitle(title, fontsize=13, fontweight='bold')
+
+    plt.show()
+
+
+#: Deepest zoom the imagery provider serves reliably. Asking for more returns
+#: empty tiles, which is another way to end up with a blank map.
+_MAX_TILE_ZOOM = 19
+
+#: Smallest map view, in metres. Below this there is nothing recognisable to
+#: look at: the map degenerates into featureless grey tiles.
+_MIN_VIEW_M = 120.0
+
+
+class _AerialTiles(_ImgTilesBase):
+    """Esri World Imagery, the closest legal equivalent of a Google Earth view.
+
+    Cartopy ships a GoogleTiles class pointing at Google's own tile servers,
+    which their terms do not allow for this. Esri publishes World Imagery for
+    exactly this purpose and asks only for the attribution printed on the plot.
+    """
+
+    def _image_url(self, tile):
+        x, y, z = tile
+        return ("https://server.arcgisonline.com/ArcGIS/rest/services/"
+                "World_Imagery/MapServer/tile/{z}/{y}/{x}".format(z=z, y=y, x=x))
+
+
+def _tile_zoom_for_view(view_m, lat_deg, px=1000):
+    """Tile zoom whose resolution suits a view of `view_m` metres across `px` pixels."""
+    ground_res = view_m / float(px)
+    equator_res = 156543.03392 * np.cos(np.deg2rad(lat_deg))
+    zoom = int(np.floor(np.log2(max(equator_res / max(ground_res, 1e-6), 1.0))))
+    return int(np.clip(zoom, 1, _MAX_TILE_ZOOM))
+
+
+def _add_track_detail_inset(ax, lats, lons, impacts, lat_c, lon_c,
+                            m_per_deg_lat, m_per_deg_lon, track_span_m,
+                            norm, cmap):
+    """Second panel showing the track in local metres, for very short tracks."""
+    north_m = (np.asarray(lats) - lat_c) * m_per_deg_lat
+    east_m = (np.asarray(lons) - lon_c) * m_per_deg_lon
+
+    inset = ax.inset_axes([0.66, 0.06, 0.32, 0.32])
+    inset.plot(east_m, north_m, '-', color='gray', linewidth=1, alpha=0.6)
+    inset.scatter(east_m, north_m, c=impacts, cmap=cmap, norm=norm, s=26,
+                  edgecolors='black', linewidths=0.3, zorder=5)
+    inset.plot(east_m[0], north_m[0], 'g^', markersize=9, zorder=10)
+    inset.plot(east_m[-1], north_m[-1], 'rs', markersize=9, zorder=10)
+
+    pad = max(track_span_m * 0.25, 0.02)
+    inset.set_xlim(east_m.min() - pad, east_m.max() + pad)
+    inset.set_ylim(north_m.min() - pad, north_m.max() + pad)
+    inset.set_aspect('equal', adjustable='box')
+    inset.grid(True, alpha=0.3, linewidth=0.5)
+    inset.tick_params(labelsize=7)
+    inset.set_xlabel('East [m]', fontsize=8)
+    inset.set_ylabel('North [m]', fontsize=8)
+
+    span_txt = ('{:.0f} cm'.format(track_span_m * 100) if track_span_m < 1.0
+                else '{:.1f} m'.format(track_span_m))
+    inset.set_title('Track detail, ' + span_txt + ' total', fontsize=8)
+    for spine in inset.spines.values():
+        spine.set_edgecolor('#ff3b30')
+        spine.set_linewidth(1.4)
+
+
+def plot_trajectory_map(kin_data: dict, epoch_results: list, param_names: list,
+                        kin_year: int = None, kin_doy: int = None,
+                        antenna_name: str = None):
+    """
+    Plots the kinematic trajectory on a map, colored by the impact magnitude.
+
+    The impact is computed as norm(North, East, Up) from the per-epoch
+    adjustment results. Each trajectory point is color-coded by this value.
+
+    Uses Cartopy coastlines/borders if available, otherwise falls back to
+    a plain matplotlib scatter plot on lat/lon axes.
+
+    Args:
+        kin_data: Dict {sod: (x_m, y_m, z_m)} from parse_kin_file().
+        epoch_results: List of (epoch_dt, results_vec, n_sats) from
+                       perform_los_adjustment().
+        param_names: List of parameter names.
+        kin_year: Year from KIN file.
+        kin_doy: DOY from KIN file.
+        antenna_name: Optional antenna name for the title.
+    """
+    if not _main_thread_only('trajectory map'):
+        return
+    from .geodesy import ecef_to_ell
+    from datetime import datetime, timedelta
+
+    if not kin_data or not epoch_results:
+        print("No KIN data or epoch results for trajectory map.")
+        return
+
+    # --- Convert ECEF to lat/lon ---
+    sods_sorted = sorted(kin_data.keys())
+    lats, lons, heights = [], [], []
+    for sod in sods_sorted:
+        x, y, z = kin_data[sod]
+        lat_rad, lon_rad, h = ecef_to_ell(x, y, z)
+        lats.append(np.degrees(lat_rad))
+        lons.append(np.degrees(lon_rad))
+        heights.append(h)
+
+    lats = np.array(lats)
+    lons = np.array(lons)
+
+    # --- Match epoch results to KIN timestamps ---
+    # Build a SOD lookup for epoch results
+    epoch_sods = {}
+    for ep_dt, results_vec, n_sats in epoch_results:
+        sod = ep_dt.hour * 3600 + ep_dt.minute * 60 + ep_dt.second
+        sod += ep_dt.microsecond / 1e6
+        epoch_sods[round(sod, 1)] = results_vec
+
+    # Extract N, E, U indices
+    try:
+        idx_n = param_names.index('North')
+        idx_e = param_names.index('East')
+        idx_u = param_names.index('Up')
+    except ValueError:
+        print("Cannot compute impact: N/E/U not in param_names.")
+        return
+
+    # Match and compute impact for each KIN point
+    impacts = []
+    matched_lats = []
+    matched_lons = []
+    for sod in sods_sorted:
+        sod_key = round(sod, 1)
+        if sod_key in epoch_sods:
+            rv = epoch_sods[sod_key]
+            impact = np.sqrt(rv[idx_n]**2 + rv[idx_e]**2 + rv[idx_u]**2)
+            impacts.append(impact)
+            idx = sods_sorted.index(sod)
+            matched_lats.append(lats[idx])
+            matched_lons.append(lons[idx])
+
+    if not impacts:
+        # Fallback: plot trajectory without coloring
+        print("  No epoch results matched to KIN timestamps. Plotting trajectory only.")
+        impacts = np.zeros(len(lats))
+        matched_lats = lats
+        matched_lons = lons
+
+    matched_lats = np.array(matched_lats)
+    matched_lons = np.array(matched_lons)
+    impacts = np.array(impacts)
+
+    # --- Plot ---
+    use_cartopy = True
+    try:
+        import cartopy.crs as ccrs
+        import cartopy.feature as cfeature
+    except ImportError:
+        use_cartopy = False
+
+    if use_cartopy:
+        fig = plt.figure(figsize=(12, 8))
+
+        # --- View extent -----------------------------------------------------
+        # Lowering the view floor to 1e-5 deg (about 1.1 m) cured a map that
+        # collapsed to a single dot, but produced the opposite symptom: at
+        # that scale there is nothing to see but the flat land polygon and
+        # the gridlines, a screen of featureless grey tiles. A useful map
+        # needs both, a visible track AND recognisable ground, so the view is
+        # kept at least _MIN_VIEW_M wide and a track too small for that scale
+        # gets its own detail panel.
+        lat_c = float((matched_lats.max() + matched_lats.min()) / 2.0)
+        lon_c = float((matched_lons.max() + matched_lons.min()) / 2.0)
+        m_per_deg_lat = 111320.0
+        m_per_deg_lon = 111320.0 * max(np.cos(np.deg2rad(lat_c)), 1e-6)
+
+        span_lat_m = float(matched_lats.max() - matched_lats.min()) * m_per_deg_lat
+        span_lon_m = float(matched_lons.max() - matched_lons.min()) * m_per_deg_lon
+        track_span_m = max(span_lat_m, span_lon_m)
+
+        view_m = max(track_span_m * 1.6, _MIN_VIEW_M)
+        half_lat = (view_m / 2.0) / m_per_deg_lat
+        half_lon = (view_m / 2.0) / m_per_deg_lon
+        extent = [lon_c - half_lon, lon_c + half_lon,
+                  lat_c - half_lat, lat_c + half_lat]
+
+        ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+        ax.set_extent(extent, crs=ccrs.PlateCarree())
+
+        # --- Background: aerial imagery, plain drawing as fallback -----------
+        got_imagery = False
+        try:
+            zoom = _tile_zoom_for_view(view_m, lat_c)
+            ax.add_image(_AerialTiles(), zoom)
+            got_imagery = True
+            print("  Trajectory map: aerial imagery at zoom {}, view {:.0f} m across.".format(
+                zoom, view_m))
+        except Exception as exc:
+            # No internet, or the provider refused. Say so and draw the plain
+            # background rather than failing the whole plot.
+            print("  Trajectory map: no imagery ({}), using plain background.".format(exc))
+
+        if not got_imagery:
+            ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
+            ax.add_feature(cfeature.BORDERS, linewidth=0.5, alpha=0.5)
+            ax.add_feature(cfeature.LAND, color='#f0f0f0', alpha=0.5)
+            ax.add_feature(cfeature.OCEAN, color='#d4e6f1', alpha=0.3)
+
+        gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.5)
+        gl.top_labels = False
+        gl.right_labels = False
+
+        # Plot full trajectory line
+        ax.plot(lons, lats, '-', color='gray', linewidth=1, alpha=0.4,
+                transform=ccrs.PlateCarree(), label='Trajectory')
+
+        # Plot colored scatter
+        sc = ax.scatter(matched_lons, matched_lats, c=impacts, cmap='hot_r',
+                        s=30, edgecolors='black', linewidths=0.3, alpha=0.9,
+                        transform=ccrs.PlateCarree(), zorder=5)
+
+        # Start/end markers
+        ax.plot(lons[0], lats[0], 'g^', markersize=12, transform=ccrs.PlateCarree(),
+                zorder=10, label='Start')
+        ax.plot(lons[-1], lats[-1], 'rs', markersize=12, transform=ccrs.PlateCarree(),
+                zorder=10, label='End')
+
+        # --- Detail inset when the track is too small to read on the map -----
+        # The shipped example moves 17 cm in total. On a 120 m map that is one
+        # pixel, so the epochs get their own panel in local metres.
+        if track_span_m < view_m * 0.05:
+            _add_track_detail_inset(ax, matched_lats, matched_lons, impacts,
+                                    lat_c, lon_c, m_per_deg_lat, m_per_deg_lon,
+                                    track_span_m, sc.norm, sc.cmap)
+            ax.plot([lon_c], [lat_c], marker='o', markersize=18, markerfacecolor='none',
+                    markeredgecolor='#ff3b30', markeredgewidth=1.6,
+                    transform=ccrs.PlateCarree(), zorder=9,
+                    label='Track (see detail)')
+
+        if got_imagery:
+            # Bottom left: the detail inset sits bottom right and its axis
+            # label would run into this text.
+            ax.text(0.005, 0.005, 'Imagery: Esri World Imagery', transform=ax.transAxes,
+                    ha='left', va='bottom', fontsize=7, color='white',
+                    bbox=dict(facecolor='black', alpha=0.35, pad=1.5, edgecolor='none'),
+                    zorder=20)
+    else:
+        fig, ax = plt.subplots(figsize=(12, 8))
+        ax.plot(lons, lats, '-', color='gray', linewidth=1, alpha=0.4, label='Trajectory')
+        sc = ax.scatter(matched_lons, matched_lats, c=impacts, cmap='hot_r',
+                        s=30, edgecolors='black', linewidths=0.3, alpha=0.9, zorder=5)
+        ax.plot(lons[0], lats[0], 'g^', markersize=12, zorder=10, label='Start')
+        ax.plot(lons[-1], lats[-1], 'rs', markersize=12, zorder=10, label='End')
+        ax.set_xlabel('Longitude [°]')
+        ax.set_ylabel('Latitude [°]')
+        ax.grid(True, alpha=0.3)
+
+    # Colorbar
+    cbar = fig.colorbar(sc, ax=ax, orientation='vertical', pad=0.02, shrink=0.8)
+    cbar.set_label(r'$\|\Delta$PCC Impact$\|$ (N,E,U) [mm]', fontsize=11)
+
+    # Title
+    title = r'Kinematic Trajectory: $\Delta$PCC Impact'
+    if antenna_name:
+        title += f'\n{antenna_name}'
+    ax.set_title(title, fontsize=14, pad=15)
+    # frameon=True is the part that matters. plot_time_series() calls
+    # plt.style.use('seaborn-v0_8-whitegrid'), which sets legend.frameon False
+    # for the WHOLE process, so any map drawn after a time series lost its
+    # legend box and rendered dark labels straight onto the Esri imagery.
+    # Nothing here may depend on which plot the user happened to open first.
+    ax.legend(loc='upper left', fontsize=9, frameon=True, facecolor='white',
+              framealpha=0.85, edgecolor='0.4', labelcolor='black')
+
+    plt.tight_layout()
+    plt.show(block=False)
+

@@ -1,5 +1,8 @@
 # PCC-Explorer
 
+- Version: 1.1.2
+- Release date: 2026-09-12
+
 **An open-source software tool to assess the impact of GNSS antenna Phase Center Corrections (PCC) on geodetic parameters.**
 
 PCC-Explorer allows researchers and practitioners to analyze how differences in antenna Phase Center Corrections propagate into estimated geodetic parameters such as coordinates and tropospheric delays.
@@ -19,6 +22,7 @@ PCC-Explorer allows researchers and practitioners to analyze how differences in 
   - [Frequency & Signal](#frequency--signal)
   - [Troposphere Mapping Function](#troposphere-mapping-function)
   - [Observation Weighting Model](#observation-weighting-model)
+  - [Computation Mode: Grid-based and Line-of-Sight](#computation-mode-grid-based-and-line-of-sight)
   - [Obstruction Masks](#obstruction-masks)
   - [Plot Settings](#plot-settings)
   - [Analysis Buttons](#analysis-buttons)
@@ -82,6 +86,13 @@ Define the station location for the analysis:
 - **Choose on Map:** Click on an interactive map to select the position
 - **Area-based calculation (Global):** Define a latitude/longitude grid for global or regional analysis with configurable resolution
 
+> **Not used in Line-of-Sight mode.** When an observation file is loaded, the
+> satellite azimuth and elevation angles are read from that file, so the station
+> coordinates above are ignored and the fields are greyed out. Converting a RINEX
+> file takes the position from its own `APPROX POSITION XYZ` header record. The
+> one exception: if that record is missing, the fields are re-enabled and the
+> position you type is used instead.
+
 ### Selection of GPS Observation Time
 
 Configure the observation period:
@@ -98,9 +109,9 @@ Select the GNSS orbit source:
 Both options download automatically, trying **several public sources in turn** so that no single server being moved, empty, or busy can break the download:
 
 - **Broadcast Ephemeris:** multi-GNSS broadcast navigation data from BKG (Bundesamt für Kartographie und Geodäsie), then NASA JPL/CDDIS as a last resort.
-- **Final Orbits (Precise):** multi-GNSS precise orbits from CODE, tried in this order — **AIUB** (`http://www.aiub.unibe.ch/download/CODE_MGEX/CODE/`, no login), then **IGN** (`igs.ign.fr`, no login), then **NASA CDDIS** (login required, used only if the first two fail). Final products are the most accurate but have a delay of a few days to ~2–3 weeks; orbits are downloaded automatically to the `data/orbit/` folder.
+- **Final Orbits (Precise):** multi-GNSS precise orbits from CODE, tried in this order: **AIUB** (`http://www.aiub.unibe.ch/download/CODE_MGEX/CODE/`, no login), then **IGN** (`igs.ign.fr`, no login), then **NASA CDDIS** (login required, used only if the first two fail). Final products are the most accurate but have a delay of a few days to ~2–3 weeks; orbits are downloaded automatically to the `data/orbit/` folder.
 
-Because the login-free sources (AIUB and IGN) are tried first, a NASA Earthdata login is **no longer required for normal use** — CDDIS is only a last-resort fallback.
+Because the login-free sources (AIUB and IGN) are tried first, a NASA Earthdata login is **no longer required for normal use**; CDDIS is only a last-resort fallback.
 
 **NASA CDDIS Credentials (optional last-resort fallback):**
 To enable NASA CDDIS as a fallback orbit source, create a file named `_netrc` (Windows) or `.netrc` (Linux/macOS) in your home directory with the following content:
@@ -136,16 +147,41 @@ Choose the mapping function for tropospheric delay modeling:
 
 Select how observations are weighted based on satellite elevation:
 
-- **sin:** Weight = sin(elevation) — standard choice
-- **sin²:** Weight = sin²(elevation) — stronger down-weighting of low-elevation observations
+- **sin:** Weight = sin(elevation), the standard choice
+- **sin²:** Weight = sin²(elevation), a stronger down-weighting of low-elevation observations
 - **unit:** Equal weight for all observations regardless of elevation
+
+### Computation Mode: Grid-based and Line-of-Sight
+
+Two ways of deciding *which directions* the ΔPCC impact is evaluated for:
+
+- **Grid-based (default):** a simulated full-sky grid combined with orbit data. No observation file is needed; this is the mode used for the analyses in the paper.
+- **Line-of-Sight (LoS):** the **real satellite directions actually observed at a station**, read from an observation file. Because it uses the true satellite geometry, it reflects what a specific station saw at a specific time, including gaps and uneven sky coverage. It supports a **static station** and a **kinematic platform** (moving position and/or changing orientation).
+
+For a LoS run you need an **observation file** (`.csv`); a moving platform additionally takes a **trajectory** (`.KIN`) and an **attitude** (`.ATT`) file. Every format is documented with a working example in **`data/examples/`**, see `data/examples/README.txt`.
+
+| File | Purpose | Required |
+|------|---------|----------|
+| `example_observation.csv` | Satellite directions per epoch: `epoch_utc, prn, elevation_deg, azimuth_deg [, heading_deg]` | Yes, for LoS |
+| `example_trajectory.KIN` | Station position per epoch (ECEF X/Y/Z in metres) | Only for a moving platform |
+| `example_attitude.ATT` | Platform yaw/pitch/roll **in radians** | Only for a rotating platform |
+| `example_obstruction_mask.json` | Azimuth-dependent horizon from RINEX-Masker | Optional, any mode |
+
+**Building the observation file from RINEX:** the *Convert → CSV* button turns a RINEX observation file directly into the LoS CSV, computing azimuth and elevation from precise orbits. This uses **RINEX-Masker**; press **RINEX-Masker folder…** once to point PCC-Explorer at your copy of it (the folder containing `rinex_handler.py`). The choice is remembered between sessions.
+
+**Moving platforms:** if a `.KIN` trajectory is loaded before you press *Convert → CSV*, the angles are computed at the rover's position **at each epoch** instead of at one fixed point. Epochs the trajectory does not cover fall back to the static position, and the dialog reports how many. The size of the difference follows how far the rover gets from the point a static conversion would have used, not how far it drove: about 0.01° at 1 km, and about 0.1° in elevation with 0.1–1.4° in azimuth at 10 km, the larger azimuth values for satellites near zenith.
+
+If no attitude file is supplied, the manual **Euler angles** (yaw/pitch/roll, in degrees) apply instead, or the optional `heading_deg` column of the CSV.
 
 ### Obstruction Masks
 
-Configure elevation and azimuth masks:
+Restrict the analysis to the part of the sky a station can actually see. Three mechanisms, combined so that the most restrictive one applies at each azimuth:
 
 - **Elevation mask:** Exclude observations below a specified elevation angle (in degrees)
 - **Azimuth mask(s):** Define azimuth sectors to exclude, using format `start-end,elevation` (e.g., 0-45,5 means mask azimuth 0°–45° below 5° elevation)
+- **Obstruction mask from RINEX-Masker:** import a complete **horizon profile**: an elevation limit that varies with azimuth, describing the real skyline of buildings and vegetation around the station. Both the `pcc-mask-v1` JSON written by RINEX-Masker's *Export Mask* and its plain-text mask are accepted; an example is in `data/examples/example_obstruction_mask.json`.
+
+> **Note on the elevation mask and the horizon profile.** Both remove observations, and a flat cut-off usually removes far more than the skyline does. To see what the imported mask itself contributes, set the elevation mask to 0. The analysis log reports how many directions the mask removed.
 
 ### Plot Settings
 
@@ -225,7 +261,8 @@ python -m src.main_cli configs/Analysis_LEIAR25.R4______LEIT_725058_config_20260
 PCC-Explorer/
 ├── data/
 │   ├── antex/               # ANTEX calibration files
-│   └── orbit/               # Downloaded orbit files (auto-populated)
+│   ├── orbit/               # Downloaded orbit files (auto-populated)
+│   └── examples/            # Example input files (CSV, KIN, ATT, mask) + README.txt
 ├── configs/                 # Configuration files
 ├── results/                 # Analysis output files
 ├── LICENSE                  # GNU GPLv3 full text
@@ -248,3 +285,21 @@ See LICENSE and LICENSE.txt
 ## Acknowledgements
 
 We thank the Center for Orbit Determination in Europe (CODE) for providing high-quality GNSS orbit products, AIUB (University of Bern) and IGN (Institut national de l'information géographique et forestière) for hosting them for public download, the Federal Agency for Cartography and Geodesy (BKG) for providing publicly accessible broadcast ephemeris data, and NASA JPL/CDDIS for providing publicly accessible GNSS data as a fallback source.
+
+## Stay informed
+
+The Institut für Erdmessung runs a moderated mailing list for its GNSS
+software. It announces new releases and warns you about changes that can break
+your work, for example when a server for satellite orbit products moves to a
+new address. Every program in the suite offers this once when it first starts,
+and the Contact dialog can open it again at any time.
+
+- Subscribe: <https://listserv.uni-hannover.de/cgi-bin/wa?SUBED1=SOFTWARE-IFE&A=1>
+- By e-mail: send the single line `subscribe software-ife` to <listserv@listserv.uni-hannover.de>
+- List address: `SOFTWARE-IFE@LISTSERV.UNI-HANNOVER.DE`
+
+Send that command line on its own. LISTSERV reads the message body line by
+line, so a signature added by your mail program can stop it. LISTSERV then
+answers with a confirmation mail, and the subscription becomes active only
+after you reply to it and a moderator approves the request. Subscribing is
+voluntary and you can leave the list at any time.

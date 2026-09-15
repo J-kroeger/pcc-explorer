@@ -182,9 +182,9 @@ def _download_from_ign_ftp(dt_obj: datetime, download_dir: str) -> str:
 
 def _download_from_aiub_ftp(dt_obj: datetime, download_dir: str) -> str:
     """
-    DEPRECATED shim. AIUB shut down anonymous FTP and moved CODE products to HTTP
-    (2026-07); this now delegates to _download_from_aiub_http(). The old FTP code
-    below is unreachable and kept only for reference.
+    DEPRECATED shim. AIUB serves CODE products over HTTP since July 2026 and no
+    longer offers anonymous FTP, so this delegates to _download_from_aiub_http().
+    The FTP code below is unreachable and kept only for reference.
     """
     return _download_from_aiub_http(dt_obj, download_dir)
     ftp_host = 'ftp.aiub.unibe.ch'  # noqa - unreachable, legacy FTP path
@@ -539,64 +539,151 @@ def _get_system_from_code(code: str) -> str:
     if code.startswith('R'): return 'GLONASS'
     if code.startswith('E'): return 'Galileo'
     if code.startswith('C'): return 'BDS'
+    if code.startswith('J'): return 'QZSS'
+    if code.startswith('S'): return 'SBAS'
     return None
 
 
-def read_antex_file(filename: str) -> dict:
+def _detect_antex_version(lines: list) -> str:
     """
-    Reads an ANTEX file and extracts PCO and PCV data for all antennas.
-
-    Args:
-        filename: Path to the ANTEX (.atx) file.
+    Detect ANTEX format version from file header lines.
 
     Returns:
-        dict with keys:
-            - 'metadata': dict mapping antenna keys to type/serial info
-            - 'pco': nested dict {antenna_key: {system: {freq_code: np.ndarray(3,)}}}
-            - 'pcv': nested dict {antenna_key: {system: {freq_code: np.ndarray(azi, zen)}}}
-            - 'canonical_map': dict for resolving canonicalized names
+        '2.0' if ANTEX 2.0, '1.4' otherwise (default/fallback).
+    """
+    for line in lines[:20]:  # Version must be in the first few header lines
+        if len(line) > 60:
+            label = line[60:].strip()
+            if 'ANTEX VERSION' in label or 'ANTEX / SYSID' in label:
+                version_str = line[:20].strip()
+                if '2' in version_str.split('.')[0] if '.' in version_str else version_str.startswith('2'):
+                    return '2.0'
+                return '1.4'
+    return '1.4'
+
+
+def _parse_frequency_block(line_iterator, line_num_ref, filename,
+                           current_antenna_key, num_zenith_steps,
+                           all_pco, all_pcv, freq_codes, end_label):
+    """
+    Parse a frequency/PHV block's PCO and PCV data.
+
+    Shared logic for ANTEX v1.4 (START OF FREQUENCY) and v2.0 (START OF PHV).
+    Stores the same PCO/PCV under each frequency code in freq_codes.
+
+    Args:
+        line_iterator: Iterator over file lines.
+        line_num_ref: Mutable list [line_num] for tracking position.
+        filename: Path for error messages.
+        current_antenna_key: Current antenna key string.
+        num_zenith_steps: Expected number of zenith steps.
+        all_pco: PCO accumulator dict.
+        all_pcv: PCV accumulator dict.
+        freq_codes: List of frequency codes to store under (e.g., ['G01'] or ['G01', 'E01', 'J01']).
+        end_label: Label string that ends this block ('END OF FREQUENCY' or 'END OF PHV').
+    """
+    current_pcv_rows = []
+    pco_vals = None
+
+    while True:
+        try:
+            data_line = next(line_iterator)
+            line_num_ref[0] += 1
+            if len(data_line) < 60:
+                continue
+            data_label = data_line[60:].strip() if len(data_line) > 60 else ""
+            data_content = data_line[0:60]
+
+            if end_label in data_label:
+                break
+
+            # PCO line (ANTEX 1.4: NORTH / EAST / UP, ANTEX 2.0: X / Y / Z)
+            if 'NORTH / EAST / UP' in data_label or 'X / Y / Z' in data_label:
+                try:
+                    pco_vals = np.array([
+                        float(data_content[0:10]),
+                        float(data_content[10:20]),
+                        float(data_content[20:30])
+                    ], dtype=float)
+                except (ValueError, IndexError) as e:
+                    if 'zeros.atx' in filename.lower():
+                        pco_vals = np.array([0.0, 0.0, 0.0], dtype=float)
+                    else:
+                        print(f" Warning: Could not parse PCO at line {line_num_ref[0]}: {e}")
+
+            # PCV rows (NOAZI or azimuth-dependent)
+            elif data_content.strip().startswith('NOAZI') or (data_content[0:10].strip() and
+                   not any(lbl in data_label for lbl in ['NORTH', 'EAST', 'UP', 'START', 'END', 'COMMENT'])):
+                pcv_values = _parse_pcv_line(data_line, num_zenith_steps)
+                if pcv_values:
+                    current_pcv_rows.append(pcv_values)
+
+        except StopIteration:
+            break
+
+    # Store results under each frequency code
+    pcv_array = np.array(current_pcv_rows, dtype=float) if current_pcv_rows else None
+
+    for fc in freq_codes:
+        system = _get_system_from_code(fc)
+        if not system:
+            continue
+        if pco_vals is not None:
+            all_pco[current_antenna_key][system][fc] = pco_vals.copy()
+        if pcv_array is not None:
+            all_pcv[current_antenna_key][system][fc] = pcv_array.copy()
+
+
+def _skip_block(line_iterator, line_num_ref, end_label):
+    """Skip lines until end_label is found (for GDV/GAIN blocks we don't process yet)."""
+    while True:
+        try:
+            data_line = next(line_iterator)
+            line_num_ref[0] += 1
+            if len(data_line) > 60:
+                data_label = data_line[60:].strip()
+                if end_label in data_label:
+                    break
+        except StopIteration:
+            break
+
+
+def _read_antex_v14(lines: list, filename: str) -> dict:
+    """
+    Parse an ANTEX v1.4 file (START OF FREQUENCY / END OF FREQUENCY blocks).
+    This is the original parser logic, refactored into a private function.
     """
     all_pco = defaultdict(lambda: defaultdict(dict))
     all_pcv = defaultdict(lambda: defaultdict(dict))
     metadata = {}
 
-    try:
-        with open(filename, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()
-    except Exception as e:
-        print(f"ERROR: Could not read file {filename}: {e}")
-        return {'metadata': {}, 'pco': {}, 'pcv': {}, 'canonical_map': {}}
-
     line_iterator = iter(lines)
-    current_antenna_key = None # Stores the unique "Type Serial" key
+    current_antenna_key = None
     num_zenith_steps = 19
-    line_num = 0
+    line_num_ref = [0]
+
+    satellite_keywords = ['BLOCK', 'GLONASS', 'GALILEO', 'BEIDOU', 'QZSS', 'IRNSS', 'SVN', 'IOV', 'FOC']
 
     for line in line_iterator:
-        line_num += 1
+        line_num_ref[0] += 1
         if len(line) < 60:
             continue
         line_label = line[60:].strip() if len(line) > 60 else ""
-        line_content = line[0:60] # Use full content for parsing
+        line_content = line[0:60]
 
-        # Parse antenna name and serial
         if 'TYPE / SERIAL NO' in line_label:
-            # ANTEX format: Type (0-20), Serial (20-40)
             ant_type = line[0:20].strip()
             ant_serial = line[20:40].strip()
-            
-            # N3: Skip satellite antennas (BLOCK IIR, IIF, IIA, etc., GLONASS, GALILEO, BEIDOU, QZSS, IRNSS)
-            satellite_keywords = ['BLOCK', 'GLONASS', 'GALILEO', 'BEIDOU', 'QZSS', 'IRNSS', 'SVN', 'IOV', 'FOC']
+
             if any(kw in ant_type.upper() for kw in satellite_keywords):
-                current_antenna_key = None  # Skip this antenna
+                current_antenna_key = None
                 continue
-            
-            # U2: Create a unique key - use TYPEMEAN instead of NONE for empty serial numbers
+
             if not ant_serial or ant_serial.upper() == "NONE":
                 ant_serial = "TYPEMEAN"
-                
+
             current_antenna_key = f"{ant_type} {ant_serial}".strip()
-            
+
             if current_antenna_key not in metadata:
                 metadata[current_antenna_key] = {
                     'type': ant_type,
@@ -608,57 +695,17 @@ def read_antex_file(filename: str) -> dict:
 
         elif ('START OF FREQUENCY' in line_label) and current_antenna_key:
             freq_code = line_content.strip().split()[0] if line_content.strip() else ""
-
             system = _get_system_from_code(freq_code)
             if not system:
                 continue
 
-            current_pcv_rows = []
-
-            while True:
-                try:
-                    data_line = next(line_iterator)
-                    line_num += 1
-                    if len(data_line) < 60:
-                        continue
-                    data_label = data_line[60:].strip() if len(data_line) > 60 else ""
-                    data_content = data_line[0:60]
-
-                    if 'END OF FREQUENCY' in data_label:
-                        break
-
-                    # PCO line
-                    if 'NORTH / EAST / UP' in data_label:
-                        try:
-                            pco_vals = np.array([
-                                float(data_content[0:10]),
-                                float(data_content[10:20]),
-                                float(data_content[20:30])
-                            ], dtype=float)
-                            
-                            all_pco[current_antenna_key][system][freq_code] = pco_vals
-                        except (ValueError, IndexError) as e:
-                            if 'zeros.atx' in filename.lower():
-                                pco_vals = np.array([0.0, 0.0, 0.0], dtype=float)
-                                all_pco[current_antenna_key][system][freq_code] = pco_vals
-                            else:
-                                print(f" Warning: Could not parse PCO at line {line_num}: {e}")
-
-                    # PCV rows (NOAZI or azimuth-dependent)
-                    # NOAZI lines contain non-azimuth-dependent PCV values
-                    # Azimuth-dependent lines start with the azimuth angle
-                    elif data_content.strip().startswith('NOAZI') or (data_content[0:10].strip() and 
-                           not any(lbl in data_label for lbl in ['NORTH', 'EAST', 'UP', 'START', 'END', 'COMMENT'])):
-                        pcv_values = _parse_pcv_line(data_line, num_zenith_steps)
-                        if pcv_values:
-                            current_pcv_rows.append(pcv_values)
-
-                except StopIteration:
-                    break
-
-            if current_pcv_rows:
-                pcv_array = np.array(current_pcv_rows, dtype=float)
-                all_pcv[current_antenna_key][system][freq_code] = pcv_array
+            _parse_frequency_block(
+                line_iterator, line_num_ref, filename,
+                current_antenna_key, num_zenith_steps,
+                all_pco, all_pcv,
+                freq_codes=[freq_code],
+                end_label='END OF FREQUENCY'
+            )
 
         elif 'ZEN1 / ZEN2 / DZEN' in line_label and current_antenna_key:
             try:
@@ -672,8 +719,6 @@ def read_antex_file(filename: str) -> dict:
                 pass
 
     all_antennas = set(list(all_pco.keys()) + list(all_pcv.keys()))
-
-    # Create canonical map (Normalizing spaces/case)
     canonical_map = {}
     for name in all_antennas:
         canonical_map[canonicalize_antenna(name)] = name
@@ -684,6 +729,235 @@ def read_antex_file(filename: str) -> dict:
         'pcv': all_pcv,
         'canonical_map': canonical_map,
     }
+
+
+def _read_antex_v2(lines: list, filename: str) -> dict:
+    """
+    Parse an ANTEX v2.0 file.
+
+    Key differences from v1.4:
+      - START OF PHV / END OF PHV (replaces START/END OF FREQUENCY for phase variations)
+      - START OF GDV / END OF GDV (group delay variations — stored but not used yet)
+      - START OF GAIN / END OF GAIN (gain patterns — stored but not used yet)
+      - Multi-frequency aggregation: START OF PHV line can list multiple freq codes
+        (e.g., "G01 E01 J01"), and the same PCO/PCV applies to all of them.
+      - Satellite antennas use SVN instead of PRN (we still skip satellites).
+    """
+    all_pco = defaultdict(lambda: defaultdict(dict))
+    all_pcv = defaultdict(lambda: defaultdict(dict))
+    # GDV and GAIN are parsed but stored separately for future use
+    all_gdv_pco = defaultdict(lambda: defaultdict(dict))
+    all_gdv_pcv = defaultdict(lambda: defaultdict(dict))
+    all_gain = defaultdict(lambda: defaultdict(dict))
+    metadata = {}
+
+    line_iterator = iter(lines)
+    current_antenna_key = None
+    num_zenith_steps = 19
+    gdv_zenith_steps = 19  # separate tracker for GDV blocks
+    line_num_ref = [0]
+
+    satellite_keywords = ['BLOCK', 'GLONASS', 'GALILEO', 'BEIDOU', 'QZSS', 'IRNSS', 'SVN', 'IOV', 'FOC']
+    # Track which block type the next ZEN/DAZI applies to
+    current_block_context = None  # 'PHV', 'GDV', 'GAIN', or None
+
+    for line in line_iterator:
+        line_num_ref[0] += 1
+        if len(line) < 60:
+            continue
+        line_label = line[60:].strip() if len(line) > 60 else ""
+        line_content = line[0:60]
+
+        if 'TYPE / SVN / SAT ID' in line_label:
+            # Satellite antenna in ANTEX 2.0: type (cols 0-30), SVN (cols 40-49), COSPAR (cols 50-60)
+            ant_type = line[0:30].strip()
+            svn = line[40:50].strip()
+
+            current_antenna_key = f"{ant_type}"
+            if svn:
+                current_antenna_key = f"{ant_type} {svn}"
+
+            if current_antenna_key not in metadata:
+                metadata[current_antenna_key] = {
+                    'type': ant_type,
+                    'svn': svn,
+                    'is_satellite': True,
+                }
+            current_block_context = None
+
+        elif 'TYPE / SN' in line_label:
+            # Receiver antenna in ANTEX 2.0: type (cols 0-20), serial (cols 20-40)
+            ant_type = line[0:20].strip()
+            ant_serial = line[20:40].strip()
+
+            if not ant_serial or ant_serial.upper() == "NONE":
+                ant_serial = "TYPEMEAN"
+
+            current_antenna_key = f"{ant_type} {ant_serial}".strip()
+
+            if current_antenna_key not in metadata:
+                metadata[current_antenna_key] = {
+                    'type': ant_type,
+                    'serial': ant_serial,
+                    'is_satellite': False,
+                }
+            current_block_context = None
+
+        elif 'TYPE / SERIAL NO' in line_label:
+            # Legacy v1.4-style label (backwards compatibility)
+            ant_type = line[0:20].strip()
+            ant_serial = line[20:40].strip()
+
+            if not ant_serial or ant_serial.upper() == "NONE":
+                ant_serial = "TYPEMEAN"
+
+            current_antenna_key = f"{ant_type} {ant_serial}".strip()
+
+            if current_antenna_key not in metadata:
+                metadata[current_antenna_key] = {
+                    'type': ant_type,
+                    'serial': ant_serial,
+                }
+            current_block_context = None
+
+        elif 'START OF ANTENNA' in line_label:
+            current_block_context = None
+
+        elif '# OF PHV' in line_label:
+            current_block_context = 'PHV'
+
+        elif '# OF GDV' in line_label:
+            current_block_context = 'GDV'
+
+        elif '# OF GAIN' in line_label:
+            current_block_context = 'GAIN'
+
+        elif ('START OF PHV' in line_label) and current_antenna_key:
+            # Parse all frequency codes from the content area (multi-freq aggregation)
+            freq_codes = line_content.strip().split()
+            freq_codes = [fc for fc in freq_codes if _get_system_from_code(fc) is not None]
+
+            if not freq_codes:
+                _skip_block(line_iterator, line_num_ref, 'END OF PHV')
+                continue
+
+            _parse_frequency_block(
+                line_iterator, line_num_ref, filename,
+                current_antenna_key, num_zenith_steps,
+                all_pco, all_pcv,
+                freq_codes=freq_codes,
+                end_label='END OF PHV'
+            )
+
+        elif ('START OF GDV' in line_label) and current_antenna_key:
+            # Group delay variations — parse but store separately
+            freq_codes = line_content.strip().split()
+            freq_codes = [fc for fc in freq_codes if _get_system_from_code(fc) is not None]
+
+            if not freq_codes:
+                _skip_block(line_iterator, line_num_ref, 'END OF GDV')
+                continue
+
+            _parse_frequency_block(
+                line_iterator, line_num_ref, filename,
+                current_antenna_key, gdv_zenith_steps,
+                all_gdv_pco, all_gdv_pcv,
+                freq_codes=freq_codes,
+                end_label='END OF GDV'
+            )
+
+        elif ('START OF GAIN' in line_label) and current_antenna_key:
+            # Gain patterns — skip for now (different data format)
+            _skip_block(line_iterator, line_num_ref, 'END OF GAIN')
+
+        # Also support legacy START OF FREQUENCY in v2.0 files (hybrid/transitional)
+        elif ('START OF FREQUENCY' in line_label) and current_antenna_key:
+            freq_code = line_content.strip().split()[0] if line_content.strip() else ""
+            system = _get_system_from_code(freq_code)
+            if not system:
+                continue
+
+            _parse_frequency_block(
+                line_iterator, line_num_ref, filename,
+                current_antenna_key, num_zenith_steps,
+                all_pco, all_pcv,
+                freq_codes=[freq_code],
+                end_label='END OF FREQUENCY'
+            )
+
+        elif 'ZEN1 / ZEN2 / DZEN' in line_label and current_antenna_key:
+            try:
+                zen1 = float(line[2:8])
+                zen2 = float(line[8:14])
+                dzen = float(line[14:20])
+                steps = int((zen2 - zen1) / dzen) + 1
+                if current_block_context in (None, 'PHV'):
+                    num_zenith_steps = steps
+                    metadata[current_antenna_key]['zenith_steps'] = steps
+                    metadata[current_antenna_key]['dzen'] = dzen
+                elif current_block_context == 'GDV':
+                    gdv_zenith_steps = steps
+            except (ValueError, KeyError):
+                pass
+
+    all_antennas = set(list(all_pco.keys()) + list(all_pcv.keys()))
+    canonical_map = {}
+    for name in all_antennas:
+        canonical_map[canonicalize_antenna(name)] = name
+
+    result = {
+        'metadata': metadata,
+        'pco': all_pco,
+        'pcv': all_pcv,
+        'canonical_map': canonical_map,
+    }
+
+    # Attach v2.0-specific data if present (for future use / ATX-Converter)
+    if all_gdv_pco or all_gdv_pcv:
+        result['gdv_pco'] = all_gdv_pco
+        result['gdv_pcv'] = all_gdv_pcv
+    if all_gain:
+        result['gain'] = all_gain
+
+    return result
+
+
+def read_antex_file(filename: str) -> dict:
+    """
+    Reads an ANTEX file and extracts PCO and PCV data for all antennas.
+    Automatically detects ANTEX version (1.4 or 2.0) and uses the
+    appropriate parser.
+
+    Args:
+        filename: Path to the ANTEX (.atx / .atx2) file.
+
+    Returns:
+        dict with keys:
+            - 'metadata': dict mapping antenna keys to type/serial info
+            - 'pco': nested dict {antenna_key: {system: {freq_code: np.ndarray(3,)}}}
+            - 'pcv': nested dict {antenna_key: {system: {freq_code: np.ndarray(azi, zen)}}}
+            - 'canonical_map': dict for resolving canonicalized names
+            - 'antex_version': '1.4' or '2.0'
+        For v2.0 files, may also contain 'gdv_pco', 'gdv_pcv', 'gain'.
+    """
+    try:
+        with open(filename, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+    except Exception as e:
+        print(f"ERROR: Could not read file {filename}: {e}")
+        return {'metadata': {}, 'pco': {}, 'pcv': {}, 'canonical_map': {},
+                'antex_version': 'unknown'}
+
+    version = _detect_antex_version(lines)
+
+    if version == '2.0':
+        print(f"  ANTEX 2.0 format detected: {os.path.basename(filename)}")
+        result = _read_antex_v2(lines, filename)
+    else:
+        result = _read_antex_v14(lines, filename)
+
+    result['antex_version'] = version
+    return result
 
 
 # ----------------------------
@@ -792,7 +1066,7 @@ def read_broadcast_file(filename: str) -> dict:
                 i += 1
                 continue
 
-        print(f"✓ Successfully parsed {records_parsed} ephemeris records")
+        print(f"[OK] Successfully parsed {records_parsed} ephemeris records")
         return broadcast_data
     except Exception as e:
         print(f"Error in read_broadcast_file: {e}")
@@ -878,7 +1152,7 @@ def read_config_file(filepath: str) -> dict:
                 'Frequenz', 'Mappingfunktion', 'Gewichtung', 'Elevationswert'
             ])
             if is_german:
-                print("German format configuration file detected — not supported in this version.")
+                print("German format configuration file detected - not supported in this version.")
                 return {}
     except Exception:
         pass
@@ -913,7 +1187,8 @@ def read_config_file(filepath: str) -> dict:
                 # Conversion logic
                 if key in ['start_date', 'end_date', 'start_time', 'end_time']:
                     config[key] = value
-                elif key in ['elevation_mask_active', 'azimuth_mask_active', 'gradient_active']:
+                elif key in ['elevation_mask_active', 'azimuth_mask_active', 'gradient_active',
+                             'obstruction_mask_active']:
                     config[key] = value.lower() == 'true'
                 elif key in ['latitude', 'longitude', 'height', 'elevation_mask_angle', 'lat_min', 'lat_max', 'lon_min', 'lon_max', 'global_grid_step']:
                     config[key] = float(value) if value else 0.0
@@ -1005,6 +1280,37 @@ def get_antenna_data(parsed_antex: dict, antenna_name: str) -> dict:
 # NEW: Result Export (Phase 2)
 # ----------------------------
 
+def create_analysis_output_dir(base_dir: str, analysis_type: str, antenna_name: str = None) -> str:
+    """
+    Creates a date-stamped analysis output subdirectory.
+
+    Output structure:
+        base_dir/YYYY-MM-DD_HH-MM-SS_AnalysisType_AntennaName/
+
+    Args:
+        base_dir: Base results directory (e.g., 'results/').
+        analysis_type: Type of analysis ('SingleAnalysis', 'LoSAnalysis',
+                       'TimeSeries', 'GlobalAnalysis').
+        antenna_name: Optional antenna identifier for the folder name.
+
+    Returns:
+        Path to the created subdirectory.
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    # Sanitize antenna name for folder name
+    if antenna_name:
+        safe_name = antenna_name.replace(' ', '_').replace('/', '_').replace('\\', '_')
+        safe_name = safe_name.replace(':', '_').replace('*', '_').replace('?', '_')
+        safe_name = safe_name.replace('"', '_').replace('<', '_').replace('>', '_').replace('|', '_')
+        folder_name = f"{timestamp}_{analysis_type}_{safe_name}"
+    else:
+        folder_name = f"{timestamp}_{analysis_type}"
+
+    output_dir = os.path.join(base_dir, folder_name)
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
+
 def save_results_to_txt(output_dir: str, filename_base: str, param_names: list, results: np.ndarray, config: dict = None):
     """
     Saves the analysis results to a formatted text file.
@@ -1035,11 +1341,8 @@ def save_results_to_txt(output_dir: str, filename_base: str, param_names: list, 
         config_filename = ""
         if config:
             config_filename = f"{safe_filename_base}_config_{timestamp}.txt"
-            # Save config to configs/ folder (sibling of results/)
-            project_root = os.path.dirname(output_dir)  # results/ -> project root
-            configs_dir = os.path.join(project_root, 'configs')
-            os.makedirs(configs_dir, exist_ok=True)
-            config_filepath = os.path.join(configs_dir, config_filename)
+            # Save config alongside results in the same output directory
+            config_filepath = os.path.join(output_dir, config_filename)
             with open(config_filepath, 'w') as cf:
                 cf.write("# PCC-Explorer Configuration File\n")
                 cf.write(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
@@ -1049,13 +1352,13 @@ def save_results_to_txt(output_dir: str, filename_base: str, param_names: list, 
                         continue  # Skip numpy array position
                     if value is None:
                         continue
-                    # Handle datetime objects → format as string
+                    # Handle datetime objects -> format as string
                     if isinstance(value, datetime):
                         if 'date' in key:
                             cf.write(f"{key}={value.strftime('%Y-%m-%d')}\n")
                         else:
                             cf.write(f"{key}={value.strftime('%Y-%m-%d %H:%M')}\n")
-                    # Handle lists → comma-separated
+                    # Handle lists -> comma-separated
                     elif isinstance(value, list):
                         cf.write(f"{key}={','.join(str(v) for v in value)}\n")
                     elif isinstance(value, (str, int, float, bool)):
@@ -1160,7 +1463,7 @@ def save_timeline_results_to_txt(output_dir: str, dates: list, results_matrix, p
             f.write("# \n")
             f.write("# ==================================================\n")
 
-        print(f"✓ Timeline results saved to: {filepath}")
+        print(f"[OK] Timeline results saved to: {filepath}")
         return filepath
     except Exception as e:
         print(f"Error saving timeline results: {e}")

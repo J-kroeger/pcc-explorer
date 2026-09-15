@@ -1,24 +1,136 @@
 # src/processing_core.py
 """
 Core logic for processing GNSS data and performing the adjustment.
-Orchestrates the gridded simulative approach:
-1. Computes the M-Matrix (observation density).
-2. Calls the gridded adjustment function.
+Orchestrates two computation modes:
+  - Grid-based simulative approach (default)
+  - Line-of-Sight (LoS) kinematic approach (v1.1)
 """
 
 import numpy as np
 import os
 import re
+import threading
 from datetime import datetime, timedelta
 
 from .data_io import (read_antex_file, download_and_unzip_broadcast_file,
                     read_broadcast_file, download_final_orbit_file,
-                    read_final_orbit_file, save_results_to_txt)
+                    read_final_orbit_file, save_results_to_txt,
+                    create_analysis_output_dir)
 
 from .adjustment import perform_adjustment, compute_m_matrix
+from .obstruction_mask import load_obstruction_mask
+from .los_adjustment import (parse_satellite_observations, perform_los_adjustment,
+                              parse_att_file, parse_kin_file, merge_kinematic_data)
+from .rinex_bridge import rinex_to_los_observations, check_rinex_masker_available
 from .orbit_utils import interpolate_orbit
 from .time_utils import datetime_to_gps_sow
 from .geodesy import ell_to_ecef  # Needed for global analysis loop
+
+
+#: Below this age no precise product exists at any source, so asking for one only
+#: produces a cascade of 404s. Measured against AIUB on 2026-08-14: a date 6 days
+#: old was present, 5 days old was not. CODE MGEX finals publish weekly, so the
+#: real latency varies roughly 5-12 days depending on the day of the week.
+PRECISE_MIN_AGE_DAYS = 5
+
+#: Age at which a precise product is reliably there whatever the day of week.
+PRECISE_SAFE_AGE_DAYS = 12
+
+
+def requested_constellations(config: dict) -> set:
+    """
+    Constellation letters the run needs, from its signal codes.
+
+    Accepts plain codes ('G01', 'E05') and IF-LC codes ('IF_G01_G02'), so a
+    combination is not mistaken for the constellation 'I'.
+    """
+    found = set()
+    for sig in config.get('signals', []) or []:
+        # \b does not fire between '_' and 'G', so 'IF_G01_G02' matched nothing
+        # and a perfectly ordinary GPS IF-LC run looked like "constellation
+        # unknown". Lookaround on the surrounding characters instead.
+        for token in re.findall(r'(?<![A-Z0-9])([GREJCS])\d{2}(?![0-9])', str(sig).upper()):
+            found.add(token)
+    return found
+
+
+def load_orbit_data(config: dict) -> dict:
+    """
+    Load orbit data for a run, falling back to broadcast when precise orbits for
+    that date are not published yet.
+
+    A run dated "yesterday" would otherwise ask four servers for a FINAL
+    product, collect four 404s and fail with "Failed to load valid orbit
+    data", a message that says nothing about what to do. No precise product
+    can exist a day after the fact.
+
+    Broadcast ephemeris is published immediately and is entirely adequate here:
+    PCC-Explorer needs satellite *directions*, and a metre of orbit error at
+    ~20 000 km is about 1e-5 deg - orders of magnitude below anything a PCC grid
+    resolves. The substitution is announced and recorded in the saved config so
+    a run always says which product it used.
+    """
+    orbit_time = config['start_time']
+    orbit_type = config.get('orbit_type', 'final')
+    orbit_dir = config['orbit_dir']
+
+    orbit_data = None
+    used = orbit_type
+
+    # The broadcast reader is GPS-only ("ephemeris propagator is GPS-only" in
+    # read_broadcast_file), so it can only stand in for a GPS-only run. Falling
+    # back for a Galileo or GLONASS analysis would hand the adjustment an empty
+    # sky rather than an error - worse than the failure it replaces.
+    wanted = requested_constellations(config)
+    broadcast_can_serve = bool(wanted) and wanted <= {'G'}
+
+    def _no_precise(reason):
+        if broadcast_can_serve:
+            print(f"\n  {reason}")
+            print("  Using broadcast ephemeris instead - satellite geometry is "
+                  "unaffected (metre-level orbit error is ~1e-5 deg in direction).")
+            return
+        others = (', '.join(sorted(wanted - {'G'})) if wanted
+                  else 'constellations that could not be determined from the selected signals')
+        raise ConnectionError(
+            f"{reason}\n\n"
+            f"Broadcast ephemeris cannot be used here: this run needs {others}, "
+            f"and the broadcast reader supports GPS only.\n"
+            f"Choose a date at least {PRECISE_SAFE_AGE_DAYS} days in the past, "
+            f"where precise multi-GNSS orbits are published."
+        )
+
+    if orbit_type == 'final':
+        age_days = (datetime.now() - orbit_time).days
+        if age_days < PRECISE_MIN_AGE_DAYS:
+            _no_precise(f"Precise orbits are not published yet for {orbit_time.date()} "
+                        f"({age_days} day(s) ago; finals appear roughly a week later).")
+            used = 'broadcast (auto: date too recent for precise orbits)'
+        else:
+            path = download_final_orbit_file(orbit_time, orbit_dir)
+            if path:
+                orbit_data = read_final_orbit_file(path)
+            if not orbit_data:
+                _no_precise(f"No precise orbit could be obtained for {orbit_time.date()}.")
+                used = 'broadcast (auto: precise orbit unavailable)'
+
+    if orbit_data is None:
+        path = download_and_unzip_broadcast_file(orbit_time, orbit_dir)
+        if path:
+            orbit_data = read_broadcast_file(path)
+
+    if not orbit_data:
+        raise ConnectionError(
+            f"No orbit data could be obtained for {orbit_time.date()}.\n\n"
+            f"Neither precise nor broadcast products were available. Check the "
+            f"internet connection, and note that broadcast files for the current "
+            f"day are only published the following day - pick a date at least "
+            f"one day in the past."
+        )
+
+    config['_orbit_source_used'] = used
+    print(f"  Orbit source used: {used}")
+    return orbit_data
 
 
 def _get_antex_grid_step(antex_data: dict, antenna_type: str) -> float:
@@ -198,6 +310,18 @@ def run_processing_pipeline(config: dict, progress_callback=None) -> tuple:
     print(f"\n{'='*60}\nPROCESSING PIPELINE STARTED\n{'='*60}")
 
     try:
+        # --- 0. Obstruction mask (optional, exported by RINEX-Masker) ---
+        # Loaded once here so the grid path (adjustment) and the LoS path
+        # (los_adjustment) mask exactly the same directions.
+        if 'obstruction_mask_obj' not in config:
+            config['obstruction_mask_obj'] = None
+            if config.get('obstruction_mask_active') and config.get('obstruction_mask_file'):
+                mask_obj = load_obstruction_mask(config['obstruction_mask_file'])
+                config['obstruction_mask_obj'] = mask_obj
+                if mask_obj is not None:
+                    print(f"  Obstruction mask: {mask_obj.summary()} "
+                          f"(from {os.path.basename(config['obstruction_mask_file'])})")
+
         # --- 1. Load ANTEX Files (Optimized) ---
         current_step += 1
         progress_callback(current_step, total_steps, "Loading ANTEX files")
@@ -319,71 +443,194 @@ def run_processing_pipeline(config: dict, progress_callback=None) -> tuple:
                 f"Please select signals that are present in the ANTEX file."
             )
 
-        # --- 3. Load Orbit Data (Optimized) ---
-        current_step += 1
-        progress_callback(current_step, total_steps, "Loading Orbit Data")
-        
-        # Check for pre-loaded orbit data
-        if 'orbit_data_obj' in config:
-            orbit_data = config['orbit_data_obj']
+        # =====================================================================
+        # BRANCH: Line-of-Sight (LoS) vs Grid-based
+        # =====================================================================
+        computation_mode = config.get('computation_mode', 'grid')
+
+        if computation_mode == 'los':
+            # --- LINE-OF-SIGHT PATH ---
+            current_step += 1
+            progress_callback(current_step, total_steps, "Loading satellite observations")
+
+            los_obs_file = config.get('los_obs_file')
+            rinex_obs_file = config.get('rinex_obs_file')
+
+            # If RINEX observation file provided, convert to CSV first
+            if rinex_obs_file and os.path.exists(rinex_obs_file):
+                if not los_obs_file:
+                    print("\n  Converting RINEX -> LoS observation CSV...")
+                    bridge_result = rinex_to_los_observations(
+                        rinex_path=rinex_obs_file,
+                        sp3_path=config.get('rinex_sp3_file'),
+                        station_xyz=config.get('rinex_station_xyz'),
+                        sampling_interval=config.get('rinex_sampling_interval', 30.0),
+                        elevation_mask=config.get('elevation_cutoff', 0.0),
+                        systems=config.get('rinex_systems'),
+                    )
+                    los_obs_file = bridge_result['csv_path']
+                    config['los_obs_file'] = los_obs_file
+                    config['_rinex_bridge_stats'] = bridge_result['stats']
+
+            if not los_obs_file:
+                raise ValueError(
+                    "No observation file specified for Line-of-Sight mode.\n"
+                    "Provide either a CSV observation file or a RINEX file."
+                )
+
+            obs_epochs, epoch_headings = parse_satellite_observations(los_obs_file)
+            if not obs_epochs:
+                raise ValueError("No valid observations found in the observation file.")
+
+            # --- Parse optional ATT/KIN kinematic files ---
+            epoch_attitudes = None
+            att_file = config.get('att_file')
+            if att_file:
+                att_data, att_year, att_doy = parse_att_file(att_file)
+                epoch_attitudes = merge_kinematic_data(
+                    obs_epochs, att_data, att_year, att_doy
+                )
+
+            kin_file = config.get('kin_file')
+            if kin_file:
+                kin_data, kin_year, kin_doy = parse_kin_file(kin_file)
+                # KIN data is stored for potential future use (rover coordinates)
+                config['_kin_data'] = kin_data
+
+            current_step += 1
+            progress_callback(current_step, total_steps, "Running LoS Adjustment")
+
+            results, param_names, az, el, sat_ids, epoch_results = perform_los_adjustment(
+                config, antex_data_1, antex_data_2, obs_epochs, epoch_headings,
+                epoch_attitudes=epoch_attitudes
+            )
+
+            if results is None or np.any(np.isnan(results)):
+                raise ValueError("LoS adjustment returned invalid results (NaN/None).")
+
+            # Save text report
+            if not config.get('is_global_run', False) and not config.get('is_timeline_run', False):
+                try:
+                    base_dir = os.path.join(os.getcwd(), 'results')
+                    output_dir = create_analysis_output_dir(base_dir, 'LoSAnalysis', original_name1)
+                    filename_base = f"LoS_Analysis_{original_name1.replace(' ', '_')}"
+                    save_results_to_txt(output_dir, filename_base, param_names, results, config)
+                except Exception as e:
+                    print(f"Warning: Could not save text report: {e}")
+
+            current_step += 1
+            progress_callback(current_step, total_steps, "Finalizing")
+            print(f"\n[OK] LoS Pipeline Complete. Results: {np.round(results, 4)}")
+
+            # --- Auto-plot trajectory map if KIN data available ---
+            # Never build a Matplotlib figure from here while running in
+            # a worker thread. The figure manager would belong to a thread that
+            # then dies, and the next plt.show() on the main thread fails with
+            # "main thread is not in main loop". In the GUI the request is handed
+            # to the caller, which draws it in its completion callback; in a
+            # headless/CLI run we are already on the main thread and draw now.
+            kin_data = config.get('_kin_data')
+            if kin_data and epoch_results:
+                request = {
+                    'kind': 'trajectory_map',
+                    'kin_data': kin_data,
+                    'epoch_results': epoch_results,
+                    'param_names': param_names,
+                    'antenna_name': config.get('antenna_type', ''),
+                }
+                if threading.current_thread() is threading.main_thread():
+                    try:
+                        from .plotting import plot_trajectory_map
+                        print("  Generating trajectory map...")
+                        plot_trajectory_map(
+                            kin_data, epoch_results, param_names,
+                            antenna_name=request['antenna_name']
+                        )
+                    except Exception as e:
+                        print(f"  Warning: Could not generate trajectory map: {e}")
+                else:
+                    config.setdefault('_pending_plots', []).append(request)
+                    print("  Trajectory map queued for the main thread.")
+
+            # Return with m_matrix=None (not used in LoS mode)
+            # epoch_results passed as 7th element for GUI epoch dropdown
+            return results, param_names, None, az, el, sat_ids, epoch_results
+
         else:
-            orbit_time = config['start_time']
-            orbit_type = config['orbit_type']
-            orbit_dir = config['orbit_dir']
-            orbit_data = None
+            # --- GRID-BASED PATH (original, unchanged) ---
 
-            if orbit_type == 'broadcast':
-                path = download_and_unzip_broadcast_file(orbit_time, orbit_dir)
-                if path: orbit_data = read_broadcast_file(path)
-            elif orbit_type == 'final':
-                path = download_final_orbit_file(orbit_time, orbit_dir)
-                if path: orbit_data = read_final_orbit_file(path)
+            # --- 3. Load Orbit Data (Optimized) ---
+            current_step += 1
+            progress_callback(current_step, total_steps, "Loading Orbit Data")
 
-            if not orbit_data:
-                raise ConnectionError(f"Failed to load valid orbit data for {orbit_time.date()}")
+            # Check for pre-loaded orbit data
+            if 'orbit_data_obj' in config:
+                orbit_data = config['orbit_data_obj']
+            else:
+                orbit_data = load_orbit_data(config)
 
-        config['orbit_data'] = orbit_data
+            config['orbit_data'] = orbit_data
 
-        # --- 4. Compute M-Matrix ---
-        current_step += 1
-        progress_callback(current_step, total_steps, "Computing P2 Matrix")
-        
-        m_matrix, az, el, sat_ids = compute_m_matrix(config)
-        if m_matrix is None:
-            raise ValueError("P2 matrix computation failed (no valid satellites found).")
+            # --- 3b. Gridded VMF1 wet coefficient (only if VMF requested) ---
+            if config.get('tropo_model') in ('VMF', 'VMF1') and config.get('vmf_aw') is None:
+                try:
+                    from .vmf import station_daily_aw
+                    from .geodesy import ecef_to_ell
+                    lat = config.get('latitude')
+                    lon = config.get('longitude')
+                    if lat is None or lon is None:
+                        lon_r, lat_r, _ = ecef_to_ell(*config['position'])
+                        lat, lon = np.rad2deg(lat_r), np.rad2deg(lon_r)
+                    vmf_dir = config.get('vmf_dir') or os.path.join(
+                        os.path.dirname(config['orbit_dir']), 'vmf')
+                    aw = station_daily_aw(config['start_time'], lat, lon, vmf_dir)
+                    config['vmf_aw'] = aw
+                    if aw is None:
+                        print("  [VMF] aw unavailable; adjustment will fall back to GMF.")
+                except Exception as exc:
+                    print(f"  [VMF] coefficient lookup failed ({exc}); falling back to GMF.")
+                    config['vmf_aw'] = None
 
-        # --- 5. Run Adjustment ---
-        current_step += 1
-        progress_callback(current_step, total_steps, "Running Adjustment")
-        
-        results, param_names, _, _, _ = perform_adjustment(
-            config, antex_data_1, antex_data_2, m_matrix
-        )
+            # --- 4. Compute M-Matrix ---
+            current_step += 1
+            progress_callback(current_step, total_steps, "Computing P2 Matrix")
 
-        if results is None or np.any(np.isnan(results)):
-             raise ValueError("Adjustment returned invalid results (NaN/None).")
-        
-        # --- Save to Text File ---
-        # Only save if NOT in global/timeline mode (to avoid many individual files)
-        if not config.get('is_global_run', False) and not config.get('is_timeline_run', False):
-            try:
-                output_dir = os.path.join(os.getcwd(), 'results')
-                filename_base = f"Analysis_{original_name1.replace(' ', '_')}"
-                save_results_to_txt(output_dir, filename_base, param_names, results, config)
-            except Exception as e:
-                print(f"Warning: Could not save text report: {e}")
+            m_matrix, az, el, sat_ids = compute_m_matrix(config)
+            if m_matrix is None:
+                raise ValueError("P2 matrix computation failed (no valid satellites found).")
 
-        # --- 6. Finalize ---
-        current_step += 1
-        progress_callback(current_step, total_steps, "Finalizing")
-        print(f"\n[OK] Pipeline Complete. Results: {np.round(results, 4)}")
+            # --- 5. Run Adjustment ---
+            current_step += 1
+            progress_callback(current_step, total_steps, "Running Adjustment")
 
-        return results, param_names, m_matrix, az, el, sat_ids
+            results, param_names, _, _, _ = perform_adjustment(
+                config, antex_data_1, antex_data_2, m_matrix
+            )
+
+            if results is None or np.any(np.isnan(results)):
+                 raise ValueError("Adjustment returned invalid results (NaN/None).")
+
+            # --- Save to Text File ---
+            if not config.get('is_global_run', False) and not config.get('is_timeline_run', False):
+                try:
+                    base_dir = os.path.join(os.getcwd(), 'results')
+                    output_dir = create_analysis_output_dir(base_dir, 'SingleAnalysis', original_name1)
+                    filename_base = f"Analysis_{original_name1.replace(' ', '_')}"
+                    save_results_to_txt(output_dir, filename_base, param_names, results, config)
+                except Exception as e:
+                    print(f"Warning: Could not save text report: {e}")
+
+            # --- 6. Finalize ---
+            current_step += 1
+            progress_callback(current_step, total_steps, "Finalizing")
+            print(f"\n[OK] Pipeline Complete. Results: {np.round(results, 4)}")
+
+            return results, param_names, m_matrix, az, el, sat_ids, []
 
     except Exception as e:
         print(f"\n[ERROR] PIPELINE ERROR: {e}")
         progress_callback(total_steps, total_steps, f"Error: {e}")
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, []
 
 
 def run_timeline_pipeline(config: dict, progress_callback=None):
@@ -432,7 +679,7 @@ def run_timeline_pipeline(config: dict, progress_callback=None):
             raise ValueError("Failed to pre-load ANTEX file 2.")
             
     except Exception as e:
-        print(f"❌ Time Series Setup Error: {e}")
+        print(f"[ERROR] Time Series Setup Error: {e}")
         return None, None, None
 
     if is_subdaily:
@@ -467,7 +714,7 @@ def run_timeline_pipeline(config: dict, progress_callback=None):
             # Prevent saving individual per-period files in timeline mode
             period_config['is_timeline_run'] = True
 
-            res, params, _, _, _, _ = run_processing_pipeline(period_config)
+            res, params, _, _, _, _, _ = run_processing_pipeline(period_config)
 
             timestamps.append(current_time)
             if res is not None:
@@ -497,7 +744,7 @@ def run_timeline_pipeline(config: dict, progress_callback=None):
             # Prevent saving individual per-period files in timeline mode
             day_config['is_timeline_run'] = True
 
-            res, params, _, _, _, _ = run_processing_pipeline(day_config)
+            res, params, _, _, _, _, _ = run_processing_pipeline(day_config)
 
             timestamps.append(curr_date)
             if res is not None:
@@ -597,7 +844,7 @@ def run_folder_pipeline(config: dict, progress_callback=None):
             continue
 
         try:
-            res, params, _, _, _, _ = run_processing_pipeline(file_config)
+            res, params, _, _, _, _, _ = run_processing_pipeline(file_config)
 
             if res is not None:
                 results_dict[fname] = res
@@ -654,21 +901,8 @@ def run_global_pipeline(config: dict, progress_callback=None):
     else:
         antex_2 = read_antex_file(config['antex_file_2'])
     
-    # Orbit (Download once for the start date)
-    orbit_time = config['start_time']
-    orbit_dir = config['orbit_dir']
-    orbit_type = config['orbit_type']
-    orbit_data = None
-    
-    if orbit_type == 'broadcast':
-        path = download_and_unzip_broadcast_file(orbit_time, orbit_dir)
-        if path: orbit_data = read_broadcast_file(path)
-    elif orbit_type == 'final':
-        path = download_final_orbit_file(orbit_time, orbit_dir)
-        if path: orbit_data = read_final_orbit_file(path)
-
-    if not orbit_data:
-        raise ConnectionError("Failed to load orbit data for global analysis.")
+    # Orbit (download once for the start date; same fallback as the single run)
+    orbit_data = load_orbit_data(config)
         
     # --- 2. Grid Loop ---
     # Store results in a 3D array (lat, lon, params)
@@ -697,7 +931,7 @@ def run_global_pipeline(config: dict, progress_callback=None):
             point_config['is_global_run'] = True
 
             # Run (suppress print output to keep console clean)
-            res, params, _, _, _, _ = run_processing_pipeline(point_config)
+            res, params, _, _, _, _, _ = run_processing_pipeline(point_config)
             
             if res is not None:
                 if results_grid is None:

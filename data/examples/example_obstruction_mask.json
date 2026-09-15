@@ -1,0 +1,25 @@
+{
+  "format": "pcc-mask-v1",
+  "uniform_cutoff_deg": 0.0,
+  "sectors": [],
+  "horizon_profile": [
+    {"azimuth": 0.0, "elevation": 6.0},
+    {"azimuth": 20.0, "elevation": 5.5},
+    {"azimuth": 40.0, "elevation": 7.0},
+    {"azimuth": 60.0, "elevation": 12.0},
+    {"azimuth": 80.0, "elevation": 18.0},
+    {"azimuth": 100.0, "elevation": 24.0},
+    {"azimuth": 120.0, "elevation": 31.0},
+    {"azimuth": 140.0, "elevation": 38.0},
+    {"azimuth": 160.0, "elevation": 42.0},
+    {"azimuth": 180.0, "elevation": 43.0},
+    {"azimuth": 200.0, "elevation": 40.0},
+    {"azimuth": 220.0, "elevation": 34.0},
+    {"azimuth": 240.0, "elevation": 26.0},
+    {"azimuth": 260.0, "elevation": 19.0},
+    {"azimuth": 280.0, "elevation": 13.0},
+    {"azimuth": 300.0, "elevation": 9.0},
+    {"azimuth": 320.0, "elevation": 7.0},
+    {"azimuth": 340.0, "elevation": 6.5}
+  ]
+}

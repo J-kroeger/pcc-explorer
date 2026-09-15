@@ -29,12 +29,48 @@ class ConfigValidator:
     MAX_ELEVATION = 90  # degrees
     MIN_EARTH_RADIUS = 6200000  # meters (lowered to allow negative heights)
     MAX_ORBIT_ALTITUDE = 30000000  # meters
-    FINAL_ORBIT_DELAY_DAYS = 21
+    # CODE MGEX finals publish weekly, so a date becomes available roughly 5-12
+    # days later. Measured against AIUB on 2026-08-14: 6 days old was present,
+    # 5 days old was not, so 12 days leaves a margin without sending users weeks
+    # back.
+    FINAL_ORBIT_DELAY_DAYS = 12
     BROADCAST_DELAY_DAYS = 2
     MAX_TIMELINE_DAYS = 90
     MIN_TIMELINE_DAYS = 1
     MAX_TIME_SPAN_HOURS = 48
     MIN_TIME_SPAN_HOURS = 1
+
+    @staticmethod
+    def broadcast_can_serve(config: Dict[str, Any]) -> bool:
+        """
+        True when broadcast ephemeris could stand in for this run's orbits.
+
+        Mirrors load_orbit_data exactly, including its treatment of an
+        undetermined constellation as "no" - callers that need to distinguish
+        "not GPS" from "nothing selected yet" must check the signal list first.
+
+        The automatic substitution only works for a GPS-only run,
+        because read_broadcast_file skips every non-GPS record by design. The
+        note printed for a recent date promised the substitution regardless, so
+        a Galileo run was told "broadcast will be used automatically" and then
+        refused by load_orbit_data with "this run needs E" one line later.
+
+        The rule is imported from processing_core rather than re-implemented:
+        two copies of that constellation regex is exactly how 'IF_G01_G02' came
+        to be read as "constellation unknown" in the first place. If the import
+        cannot be resolved the caller keeps the previous, unconditional wording
+        - a vague note is better than a wrong one.
+        """
+        try:
+            from .processing_core import requested_constellations
+        except ImportError:  # flat layout / frozen build
+            try:
+                from processing_core import requested_constellations
+            except ImportError:
+                return True
+
+        wanted = requested_constellations(config)
+        return bool(wanted) and wanted <= {'G'}
 
     @staticmethod
     def validate_config(config: Dict[str, Any], analysis_type: str) -> Tuple[bool, Optional[str]]:
@@ -126,13 +162,13 @@ class ConfigValidator:
         # Check if folder contains .atx files
         try:
             atx_files = [f for f in os.listdir(folder_path)
-                        if f.lower().endswith('.atx')]
+                        if f.lower().endswith(('.atx', '.atx2'))]
         except PermissionError:
             raise ValidationError(f"Permission denied accessing folder:\n{folder_path}")
 
         if len(atx_files) == 0:
             raise ValidationError(
-                f"No ANTEX (.atx) files found in folder:\n{folder_path}"
+                f"No ANTEX (.atx / .atx2) files found in folder:\n{folder_path}"
             )
 
         if len(atx_files) < 2:
@@ -157,9 +193,9 @@ class ConfigValidator:
         if not os.path.isfile(antex_file_1):
             raise ValidationError(f"First ANTEX path is not a file:\n{antex_file_1}")
 
-        if not antex_file_1.lower().endswith('.atx'):
+        if not antex_file_1.lower().endswith(('.atx', '.atx2')):
             raise ValidationError(
-                f"First file does not appear to be an ANTEX file (.atx):\n{antex_file_1}"
+                f"First file does not appear to be an ANTEX file (.atx / .atx2):\n{antex_file_1}"
             )
 
         # Skip File 2 validation for single-file mode
@@ -173,9 +209,9 @@ class ConfigValidator:
             if not os.path.isfile(antex_file_2):
                 raise ValidationError(f"Second ANTEX path is not a file:\n{antex_file_2}")
 
-            if not antex_file_2.lower().endswith('.atx'):
+            if not antex_file_2.lower().endswith(('.atx', '.atx2')):
                 raise ValidationError(
-                    f"Second file does not appear to be an ANTEX file (.atx):\n{antex_file_2}"
+                    f"Second file does not appear to be an ANTEX file (.atx / .atx2):\n{antex_file_2}"
                 )
 
         # Check file sizes (basic sanity check)
@@ -389,11 +425,29 @@ class ConfigValidator:
             if start_time and orbit_type == 'final':
                 days_ago = (datetime.now() - start_time).days
                 if days_ago < ConfigValidator.FINAL_ORBIT_DELAY_DAYS:
-                    print(
-                        f"WARNING: Selected date is only {days_ago} days ago.\n"
-                        f"Final orbits may not be available yet (typically {ConfigValidator.FINAL_ORBIT_DELAY_DAYS} day delay).\n"
-                        f"Consider using broadcast ephemeris for recent dates."
+                    note = (
+                        f"NOTE: Selected date is {days_ago} day(s) ago. Precise orbits "
+                        f"appear about {ConfigValidator.FINAL_ORBIT_DELAY_DAYS} days later, "
+                        f"so they may not exist yet.\n"
                     )
+                    # Only promise the substitution where it can
+                    # happen. With no signals to judge by, say nothing further
+                    # rather than guess in either direction.
+                    if not (config.get('signals') or []):
+                        pass
+                    elif ConfigValidator.broadcast_can_serve(config):
+                        note += (
+                            f"      Broadcast ephemeris will be used automatically if the "
+                            f"precise product is missing; satellite geometry is unaffected."
+                        )
+                    else:
+                        note += (
+                            f"      Broadcast ephemeris cannot stand in for this run - the "
+                            f"broadcast reader supports GPS only, so a non-GPS signal needs "
+                            f"the precise product. Choose a date at least "
+                            f"{ConfigValidator.FINAL_ORBIT_DELAY_DAYS} days in the past."
+                        )
+                    print(note)
 
         # Validate elevation mask
         if config.get('elevation_mask_active'):
@@ -468,7 +522,7 @@ class ConfigValidator:
 
         # Validate troposphere model
         tropo_model = config.get('tropo_model')
-        valid_tropo = ['1/sin(Elevation)', 'GMF', 'None']
+        valid_tropo = ['1/sin(Elevation)', 'GMF', 'VMF', 'VMF1', 'None']
 
         if tropo_model and tropo_model not in valid_tropo:
             raise ValidationError(
