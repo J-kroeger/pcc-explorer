@@ -9,7 +9,8 @@ launcher deliberately does not show it, because it only starts the others.
 The list exists to reach users when something changes that would otherwise
 break their work, for example the AIUB orbit server moving to a new address.
 Subscribing is voluntary and stays the user's choice. The list is moderated:
-only the maintainers can post, and every subscription is approved.
+only the maintainers can post. A subscription becomes active once the
+subscriber confirms it by e-mail.
 
 Two subscription routes are offered. The web form is the main one, because a
 mailto link only does something on a machine that has a desktop mail program
@@ -46,13 +47,13 @@ except Exception:                                    # plain tkinter fallback
 
 
 # --- The institute software mailing list ------------------------------------
-LIST_NAME = "SOFTWARE-IFE"
-LIST_ADDRESS = "SOFTWARE-IFE@LISTSERV.UNI-HANNOVER.DE"
-LISTSERV_ADDRESS = "listserv@listserv.uni-hannover.de"
-SUBSCRIBE_COMMAND = "subscribe software-ife"
-SUBSCRIBE_URL = (
-    "https://listserv.uni-hannover.de/cgi-bin/wa?SUBED1=SOFTWARE-IFE&A=1"
-)
+LIST_NAME = "ife-software"
+LIST_ADDRESS = "ife-software@lists.uni-hannover.de"
+COMMAND_ADDRESS = "sympa@lists.uni-hannover.de"
+SUBSCRIBE_COMMAND = "subscribe ife-software"
+# Ends the commands in a mail body, so the server ignores a signature after it.
+END_COMMAND = "QUIT"
+SUBSCRIBE_URL = "https://lists.uni-hannover.de/sympa/subscribe/ife-software"
 
 # How long "No thanks" keeps the dialog away. "Do not show this again" is final.
 REMIND_AFTER_DAYS = 30
@@ -155,9 +156,9 @@ def _open_url(url):
 
 
 def mailto_url():
-    """A mailto whose body is the command line and nothing else."""
+    """A mailto whose body is the command line, then QUIT, and nothing else."""
     return "mailto:%s?subject=&body=%s" % (
-        LISTSERV_ADDRESS, quote(SUBSCRIBE_COMMAND),
+        COMMAND_ADDRESS, quote("%s\r\n%s" % (SUBSCRIBE_COMMAND, END_COMMAND)),
     )
 
 
@@ -257,21 +258,21 @@ def show_dialog(parent, program_name="PCC-Suite"):
     ttk.Label(
         frame,
         text=("Subscribe opens the subscription form in your browser. To use "
-              "e-mail instead, send the command line below to the LISTSERV "
-              "address, on its own: LISTSERV reads the body line by line, so a "
-              "signature from your mail program can stop it."),
+              "e-mail instead, send the command line below to the list "
+              "server, with the word %s on the next line: the server stops "
+              "reading there, so a signature from your mail program does no "
+              "harm." % END_COMMAND),
         wraplength=_WRAP, justify="left",
     ).pack(anchor="w", pady=(0, 8))
 
     _copy_row(frame, "List address:", LIST_ADDRESS)
-    _copy_row(frame, "Send to:", LISTSERV_ADDRESS)
+    _copy_row(frame, "Send to:", COMMAND_ADDRESS)
     _copy_row(frame, "Message body:", SUBSCRIBE_COMMAND)
 
     ttk.Label(
         frame,
-        text=("LISTSERV answers with a confirmation mail. Your subscription "
-              "becomes active only after you reply to it and a moderator "
-              "approves the request."),
+        text=("The list server answers with a mail that asks you to confirm. "
+              "Your subscription becomes active once you confirm it."),
         wraplength=_WRAP, justify="left", foreground="#ffc107",
     ).pack(anchor="w", pady=(12, 0))
 
@@ -296,9 +297,9 @@ def show_dialog(parent, program_name="PCC-Suite"):
         messagebox.showinfo(
             "One more step",
             "%s\n\n"
-            "LISTSERV will send you a confirmation mail. Please reply to it, "
-            "otherwise the subscription is not completed. A moderator then "
-            "approves the request.\n\n"
+            "The list server will send you a mail that asks you to confirm. "
+            "Please confirm it, otherwise the subscription is not "
+            "completed.\n\n"
             "List: %s" % (route, LIST_ADDRESS),
             parent=parent,
         )
@@ -320,14 +321,15 @@ def show_dialog(parent, program_name="PCC-Suite"):
         _finish("subscribed")
         if opened:
             _after_subscribe(
-                "A new mail to %s was prepared, with the single line "
-                "'%s' in the body. Please send it without adding anything "
-                "else." % (LISTSERV_ADDRESS, SUBSCRIBE_COMMAND))
+                "A new mail to %s was prepared, with the line '%s' and the "
+                "word %s in the body. Please send it as it is."
+                % (COMMAND_ADDRESS, SUBSCRIBE_COMMAND, END_COMMAND))
         else:
             messagebox.showwarning(
                 "Could not open your mail program",
-                "Please send a mail to %s with the single line\n\n%s\n\n"
-                "in the message body." % (LISTSERV_ADDRESS, SUBSCRIBE_COMMAND),
+                "Please send a mail to %s with these two lines in the "
+                "message body:\n\n%s\n%s"
+                % (COMMAND_ADDRESS, SUBSCRIBE_COMMAND, END_COMMAND),
                 parent=parent,
             )
 

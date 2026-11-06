@@ -715,7 +715,7 @@ def _add_track_detail_inset(ax, lats, lons, impacts, lat_c, lon_c,
 
 def plot_trajectory_map(kin_data: dict, epoch_results: list, param_names: list,
                         kin_year: int = None, kin_doy: int = None,
-                        antenna_name: str = None):
+                        antenna_name: str = None, offline: bool = False):
     """
     Plots the kinematic trajectory on a map, colored by the impact magnitude.
 
@@ -733,6 +733,8 @@ def plot_trajectory_map(kin_data: dict, epoch_results: list, param_names: list,
         kin_year: Year from KIN file.
         kin_doy: DOY from KIN file.
         antenna_name: Optional antenna name for the title.
+        offline: True skips the aerial imagery, which is fetched from the
+                 internet, and draws the plain background.
     """
     if not _main_thread_only('trajectory map'):
         return
@@ -837,16 +839,20 @@ def plot_trajectory_map(kin_data: dict, epoch_results: list, param_names: list,
 
         # --- Background: aerial imagery, plain drawing as fallback -----------
         got_imagery = False
-        try:
-            zoom = _tile_zoom_for_view(view_m, lat_c)
-            ax.add_image(_AerialTiles(), zoom)
-            got_imagery = True
-            print("  Trajectory map: aerial imagery at zoom {}, view {:.0f} m across.".format(
-                zoom, view_m))
-        except Exception as exc:
-            # No internet, or the provider refused. Say so and draw the plain
-            # background rather than failing the whole plot.
-            print("  Trajectory map: no imagery ({}), using plain background.".format(exc))
+        if offline:
+            print("  Trajectory map: local-files mode, no imagery download; "
+                  "using plain background.")
+        else:
+            try:
+                zoom = _tile_zoom_for_view(view_m, lat_c)
+                ax.add_image(_AerialTiles(), zoom)
+                got_imagery = True
+                print("  Trajectory map: aerial imagery at zoom {}, view {:.0f} m across.".format(
+                    zoom, view_m))
+            except Exception as exc:
+                # No internet, or the provider refused. Say so and draw the plain
+                # background rather than failing the whole plot.
+                print("  Trajectory map: no imagery ({}), using plain background.".format(exc))
 
         if not got_imagery:
             ax.add_feature(cfeature.COASTLINE, linewidth=0.8)

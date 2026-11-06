@@ -15,6 +15,7 @@ WGS84_A = 6378137.0         # WGS84 semi-major axis
 WGS84_F = 1 / 298.257223563 # WGS84 flattening
 WGS84_E2 = WGS84_F * (2 - WGS84_F) # WGS84 first eccentricity squared
 GM = 3.986005e14            # Earth gravitational constant (WGS84) [m^3/s^2]
+GM_GALILEO = 3.986004418e14 # Earth gravitational constant (GTRF, Galileo) [m^3/s^2]
 OMEGA_E = 7.2921151467e-5   # Earth rotation rate (WGS84) [rad/s]
 C = 299792458.0             # Speed of light [m/s]
 
@@ -84,12 +85,14 @@ def ecef_to_topocentric(station_ecef: np.ndarray, target_ecef: np.ndarray) -> Tu
 def compute_satellite_position(eph: dict, t_gps_sow: float) -> np.ndarray:
     """
     Computes satellite ECEF position from broadcast ephemeris at a given time.
+    GPS and Galileo use the same Keplerian model; only the value of GM differs.
     """
     t_k = t_gps_sow - eph['Toe']
     if t_k > 302400: t_k -= 604800
     if t_k < -302400: t_k += 604800
-        
-    n_0 = np.sqrt(GM / (eph['sqrt_A']**6))
+
+    gm = GM_GALILEO if eph.get('system') == 'E' else GM
+    n_0 = np.sqrt(gm / (eph['sqrt_A']**6))
     n = n_0 + eph['Delta_n']
     M_k = eph['M0'] + n * t_k
     

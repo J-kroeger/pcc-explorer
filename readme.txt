@@ -2,8 +2,8 @@
                               PCC-Explorer
 ================================================================================
 
-Version: 1.1.2
-Release date: 2026-09-12
+Version: 1.2.0
+Release date: 2026-11-01
 
 An open-source software tool to assess the impact of GNSS antenna Phase Center
 Corrections (PCC) on geodetic parameters.
@@ -106,7 +106,7 @@ Select the GNSS orbit source:
 
   * Broadcast Ephemeris: multi-GNSS broadcast navigation data from BKG
     (Bundesamt für Kartographie und Geodäsie), then NASA JPL/CDDIS as a
-    last resort.
+    last resort. GPS and Galileo satellites are evaluated.
   * Final Orbits (Precise): multi-GNSS precise orbits from CODE, tried in
     this order - AIUB (http://www.aiub.unibe.ch/download/CODE_MGEX/CODE/,
     no login), then IGN (igs.ign.fr, no login), then NASA CDDIS (login
@@ -128,6 +128,32 @@ Select the GNSS orbit source:
         password <your_password>
 
   Register for a free account at: https://urs.earthdata.nasa.gov/
+
+  Local orbit files (no internet access):
+  For networks without internet access, tick "Use local orbit files (no
+  download)" and select the folder that holds your daily orbit files.
+  PCC-Explorer then contacts no server at all: orbits come from the folder,
+  VMF grids only from the local cache (otherwise GMF is used), and the
+  trajectory map is drawn without aerial imagery.
+
+  * Accepted files: SP3 orbits (precise, rapid, ultra-rapid or predicted)
+    and RINEX navigation files, versions 2, 3 and 4, including mixed files.
+    Files compressed with gzip (.gz) are read directly; Unix-compressed
+    files (.Z) must be decompressed first.
+  * How the file is found: files with standard IGS names for the day (for
+    example COD0MGXFIN_20220070000_01D_05M_ORB.SP3,
+    BRDC00IGS_R_20220070000_01D_MN.rnx, brdc0070.22n) are tried first, and
+    only those are opened. If none fits, the other files in the folder are
+    identified by their content, so renamed files also work. Sub-folders
+    named YYYY, YYYY\DDD or DDD are searched too.
+  * Which kind is preferred: with Final Orbits an SP3 file is tried first,
+    with Broadcast Ephemeris a navigation file. If the preferred kind is
+    missing for that day, the other kind is used and the log says so.
+  * Systems: navigation files serve GPS and Galileo. Runs with other
+    systems need an SP3 file.
+
+  In a configuration file the same mode is set with use_local_orbits=True
+  and local_orbit_dir=<folder>.
 
 Frequency & Signal
 ------------------
@@ -354,17 +380,18 @@ for providing publicly accessible GNSS data as a fallback source.
   first starts, and the Contact dialog can open it again at any time.
 
   Subscribe (web form):
-    https://listserv.uni-hannover.de/cgi-bin/wa?SUBED1=SOFTWARE-IFE&A=1
+    https://lists.uni-hannover.de/sympa/subscribe/ife-software
 
   Subscribe by e-mail:
-    send the single line   subscribe software-ife
-    to                     listserv@listserv.uni-hannover.de
+    send the two lines     subscribe ife-software
+                           QUIT
+    to                     sympa@lists.uni-hannover.de
 
-  Send that command line on its own. LISTSERV reads the message body line by
-  line, so a signature added by your mail program can stop it.
+  The word QUIT tells the list server to stop reading, so a signature added
+  by your mail program does no harm.
 
-  List address: SOFTWARE-IFE@LISTSERV.UNI-HANNOVER.DE
+  List address: ife-software@lists.uni-hannover.de
 
-  LISTSERV answers with a confirmation mail. The subscription becomes active
-  only after you reply to it and a moderator approves the request. Subscribing
-  is voluntary and you can leave the list at any time.
+  The list server answers with a mail that asks you to confirm. The
+  subscription becomes active once you confirm it. Subscribing is voluntary
+  and you can leave the list at any time.

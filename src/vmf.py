@@ -54,13 +54,15 @@ _GRID_CACHE: Dict[Tuple[str, int], dict] = {}
 # =============================================================================
 # Download + parse
 # =============================================================================
-def download_vmf1_grid(epoch: datetime, vmf_dir: str, timeout: int = 60) -> Optional[str]:
+def download_vmf1_grid(epoch: datetime, vmf_dir: str, timeout: int = 60,
+                       allow_download: bool = True) -> Optional[str]:
     """Download one 6-hourly VMF1 grid file (cached). Returns local path or None.
 
     Args:
         epoch: UTC epoch; only the date and the 6-hourly hour (0/6/12/18) are used.
         vmf_dir: Local cache directory (created if missing).
         timeout: HTTP timeout in seconds.
+        allow_download: False uses the local cache only (offline runs).
     """
     hh = (epoch.hour // 6) * 6
     ymd = epoch.strftime("%Y%m%d")
@@ -71,7 +73,7 @@ def download_vmf1_grid(epoch: datetime, vmf_dir: str, timeout: int = 60) -> Opti
         return local
 
     url = VMF1_BASE_URL.format(year=epoch.year, ymd=ymd, hh=hh)
-    if _urlreq is None:
+    if _urlreq is None or not allow_download:
         return None
     try:
         with _urlreq.urlopen(url, timeout=timeout) as resp:
@@ -108,14 +110,14 @@ def parse_vmf1_grid(path: str) -> dict:
     return {"lat": lats, "lon": lons, "ah": ah, "aw": aw}
 
 
-def _get_grid(epoch: datetime, vmf_dir: str) -> Optional[dict]:
+def _get_grid(epoch: datetime, vmf_dir: str, allow_download: bool = True) -> Optional[dict]:
     """Return parsed grid for the 6-hourly slot containing ``epoch`` (cached)."""
     hh = (epoch.hour // 6) * 6
     key = (epoch.strftime("%Y%m%d"), hh)
     if key in _GRID_CACHE:
         return _GRID_CACHE[key]
     slot = epoch.replace(hour=hh, minute=0, second=0, microsecond=0)
-    path = download_vmf1_grid(slot, vmf_dir)
+    path = download_vmf1_grid(slot, vmf_dir, allow_download=allow_download)
     if not path:
         return None
     grid = parse_vmf1_grid(path)
@@ -145,14 +147,15 @@ def _bilinear(lats: np.ndarray, lons: np.ndarray, field: np.ndarray,
                  + (f10 * (1 - fx) + f11 * fx) * fy)
 
 
-def aw_at(epoch: datetime, lat_deg: float, lon_deg: float, vmf_dir: str) -> Optional[float]:
+def aw_at(epoch: datetime, lat_deg: float, lon_deg: float, vmf_dir: str,
+          allow_download: bool = True) -> Optional[float]:
     """Wet mapping coefficient ``aw`` at a station, time-interpolated between the
     two bracketing 6-hourly VMF1 grids."""
     hh0 = (epoch.hour // 6) * 6
     lower = epoch.replace(hour=hh0, minute=0, second=0, microsecond=0)
     upper = lower + timedelta(hours=6)
-    g0 = _get_grid(lower, vmf_dir)
-    g1 = _get_grid(upper, vmf_dir)
+    g0 = _get_grid(lower, vmf_dir, allow_download)
+    g1 = _get_grid(upper, vmf_dir, allow_download)
     if g0 is None and g1 is None:
         return None
     if g1 is None:
@@ -167,16 +170,17 @@ def aw_at(epoch: datetime, lat_deg: float, lon_deg: float, vmf_dir: str) -> Opti
 
 
 def station_daily_aw(date: datetime, lat_deg: float, lon_deg: float,
-                     vmf_dir: str) -> Optional[float]:
+                     vmf_dir: str, allow_download: bool = True) -> Optional[float]:
     """Mean ``aw`` for a station over the four 6-hourly epochs of ``date``.
 
     A single representative value is adequate for the adjustment's troposphere
     design column (aw varies slowly and largely cancels in GAL-GPS differences).
+    With ``allow_download=False`` only grids already in ``vmf_dir`` are used.
     """
     day = date.replace(hour=0, minute=0, second=0, microsecond=0)
     vals = []
     for hh in (0, 6, 12, 18):
-        a = aw_at(day + timedelta(hours=hh), lat_deg, lon_deg, vmf_dir)
+        a = aw_at(day + timedelta(hours=hh), lat_deg, lon_deg, vmf_dir, allow_download)
         if a is not None and np.isfinite(a):
             vals.append(a)
     return float(np.mean(vals)) if vals else None

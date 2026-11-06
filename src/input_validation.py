@@ -49,8 +49,8 @@ class ConfigValidator:
         undetermined constellation as "no" - callers that need to distinguish
         "not GPS" from "nothing selected yet" must check the signal list first.
 
-        The automatic substitution only works for a GPS-only run,
-        because read_broadcast_file skips every non-GPS record by design. The
+        The automatic substitution only works for a run restricted to GPS and
+        Galileo, because read_broadcast_file evaluates only those systems. The
         note printed for a recent date promised the substitution regardless, so
         a Galileo run was told "broadcast will be used automatically" and then
         refused by load_orbit_data with "this run needs E" one line later.
@@ -70,7 +70,7 @@ class ConfigValidator:
                 return True
 
         wanted = requested_constellations(config)
-        return bool(wanted) and wanted <= {'G'}
+        return bool(wanted) and wanted <= {'G', 'E'}
 
     @staticmethod
     def validate_config(config: Dict[str, Any], analysis_type: str) -> Tuple[bool, Optional[str]]:
@@ -419,8 +419,18 @@ class ConfigValidator:
                 f"Must be either 'broadcast' or 'final'"
             )
 
+        # Local orbit files: the folder must exist; publication delays of the
+        # servers do not apply.
+        if config.get('use_local_orbits'):
+            folder = (config.get('local_orbit_dir') or '').strip()
+            if not folder:
+                raise ValidationError(
+                    "'Use local orbit files' is on, but no orbit folder is selected.")
+            if not os.path.isdir(folder):
+                raise ValidationError(f"Local orbit folder not found:\n{folder}")
+
         # Check orbit availability based on date
-        if analysis_type != 'timeline':
+        elif analysis_type != 'timeline':
             start_time = config.get('start_time') or config.get('start_date')
             if start_time and orbit_type == 'final':
                 days_ago = (datetime.now() - start_time).days
@@ -443,8 +453,8 @@ class ConfigValidator:
                     else:
                         note += (
                             f"      Broadcast ephemeris cannot stand in for this run - the "
-                            f"broadcast reader supports GPS only, so a non-GPS signal needs "
-                            f"the precise product. Choose a date at least "
+                            f"broadcast reader supports GPS and Galileo only, so another "
+                            f"system needs the precise product. Choose a date at least "
                             f"{ConfigValidator.FINAL_ORBIT_DELAY_DAYS} days in the past."
                         )
                     print(note)

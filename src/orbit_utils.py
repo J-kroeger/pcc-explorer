@@ -71,7 +71,7 @@ def propagate_broadcast_orbit(ephemeris: dict, start_time: datetime, end_time: d
     while current_time <= end_time:
         try:
             _, reception_sow = datetime_to_gps_sow(current_time)
-            sat_pos = compute_satellite_position(ephemeris, reception_sow, station_pos)
+            sat_pos = compute_satellite_position(ephemeris, reception_sow)
             
             if sat_pos is not None and not np.any(np.isnan(sat_pos)):
                 track_points.append((current_time, sat_pos))

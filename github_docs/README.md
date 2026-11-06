@@ -1,7 +1,7 @@
 # PCC-Explorer
 
-- Version: 1.1.2
-- Release date: 2026-09-12
+- Version: 1.2.0
+- Release date: 2026-11-01
 
 **An open-source software tool to assess the impact of GNSS antenna Phase Center Corrections (PCC) on geodetic parameters.**
 
@@ -40,7 +40,7 @@ PCC-Explorer allows researchers and practitioners to analyze how differences in 
 
 If you use this software, please cite:
 
-> Kröger J., Kersten T., Schön S. (2026) PCC-Explorer: An open-source software tool to assess the impact of GNSS antenna phase center corrections on geodetic parameters. GPS Solutions. <https://doi.org/10.1007/s10291-026-02056-2>
+> Kröger, J., Kersten, T. & Schön, S. PCC-Explorer: An open-source software tool to assess the impact of GNSS antenna phase center corrections on geodetic parameters. GPS Solut 30, 93 (2026). https://doi.org/10.1007/s10291-026-02056-2
 
 ---
 
@@ -108,7 +108,7 @@ Select the GNSS orbit source:
 
 Both options download automatically, trying **several public sources in turn** so that no single server being moved, empty, or busy can break the download:
 
-- **Broadcast Ephemeris:** multi-GNSS broadcast navigation data from BKG (Bundesamt für Kartographie und Geodäsie), then NASA JPL/CDDIS as a last resort.
+- **Broadcast Ephemeris:** multi-GNSS broadcast navigation data from BKG (Bundesamt für Kartographie und Geodäsie), then NASA JPL/CDDIS as a last resort. GPS and Galileo satellites are evaluated.
 - **Final Orbits (Precise):** multi-GNSS precise orbits from CODE, tried in this order: **AIUB** (`http://www.aiub.unibe.ch/download/CODE_MGEX/CODE/`, no login), then **IGN** (`igs.ign.fr`, no login), then **NASA CDDIS** (login required, used only if the first two fail). Final products are the most accurate but have a delay of a few days to ~2–3 weeks; orbits are downloaded automatically to the `data/orbit/` folder.
 
 Because the login-free sources (AIUB and IGN) are tried first, a NASA Earthdata login is **no longer required for normal use**; CDDIS is only a last-resort fallback.
@@ -121,6 +121,17 @@ machine urs.earthdata.nasa.gov
     password <your_password>
 ```
 Register for a free account at: https://urs.earthdata.nasa.gov/
+
+#### Local orbit files (no internet access)
+
+For networks without internet access, tick **Use local orbit files (no download)** and select the folder that holds your daily orbit files. PCC-Explorer then contacts no server at all: orbits come from the folder, VMF grids only from the local cache (otherwise GMF is used), and the trajectory map is drawn without aerial imagery.
+
+- **Accepted files:** SP3 orbits (precise, rapid, ultra-rapid or predicted) and RINEX navigation files, versions 2, 3 and 4, including mixed files. Files compressed with gzip (`.gz`) are read directly; Unix-compressed files (`.Z`) must be decompressed first.
+- **How the file is found:** files with standard IGS names for the day (for example `COD0MGXFIN_20220070000_01D_05M_ORB.SP3`, `BRDC00IGS_R_20220070000_01D_MN.rnx`, `brdc0070.22n`) are tried first, and only those are opened. If none fits, the other files in the folder are identified by their content, so renamed files also work. Sub-folders named `YYYY`, `YYYY/DDD` or `DDD` are searched too.
+- **Which kind is preferred:** with *Final Orbits* an SP3 file is tried first, with *Broadcast Ephemeris* a navigation file. If the preferred kind is missing for that day, the other kind is used and the log says so.
+- **Systems:** navigation files serve **GPS and Galileo**. Runs with other systems need an SP3 file.
+
+In a configuration file the same mode is set with `use_local_orbits=True` and `local_orbit_dir=<folder>`.
 
 ### Frequency & Signal
 
@@ -294,12 +305,11 @@ your work, for example when a server for satellite orbit products moves to a
 new address. Every program in the suite offers this once when it first starts,
 and the Contact dialog can open it again at any time.
 
-- Subscribe: <https://listserv.uni-hannover.de/cgi-bin/wa?SUBED1=SOFTWARE-IFE&A=1>
-- By e-mail: send the single line `subscribe software-ife` to <listserv@listserv.uni-hannover.de>
-- List address: `SOFTWARE-IFE@LISTSERV.UNI-HANNOVER.DE`
+- Subscribe: <https://lists.uni-hannover.de/sympa/subscribe/ife-software>
+- By e-mail: send the line `subscribe ife-software` and, on the next line, `QUIT` to <sympa@lists.uni-hannover.de>
+- List address: `ife-software@lists.uni-hannover.de`
 
-Send that command line on its own. LISTSERV reads the message body line by
-line, so a signature added by your mail program can stop it. LISTSERV then
-answers with a confirmation mail, and the subscription becomes active only
-after you reply to it and a moderator approves the request. Subscribing is
-voluntary and you can leave the list at any time.
+The word QUIT tells the list server to stop reading, so a signature added by
+your mail program does no harm. The list server then answers with a mail that
+asks you to confirm, and the subscription becomes active once you confirm it.
+Subscribing is voluntary and you can leave the list at any time.

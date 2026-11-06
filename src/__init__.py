@@ -5,45 +5,53 @@ Main package for the Delta PCC Impact Analysis Tool.
 
 This file makes key functions from submodules directly available
 at the package level, simplifying imports.
+
+The names are loaded on first use (PEP 562), so that importing one module,
+for example ``from src.data_io import read_antex_file`` in PCC-Viewer and
+ATX-Converter, does not also import the processing and plotting modules and
+their large dependencies (scipy, pyproj, matplotlib, cartopy).
 """
 
-# Import key functions from each module
-from .data_io import (
-    read_antex_file,
-    download_and_unzip_broadcast_file,
-    read_broadcast_file,
-    download_final_orbit_file,
-    read_final_orbit_file
-)
+import importlib
 
-from .geodesy import (
-    ell_to_ecef,
-    ecef_to_topocentric,
-    compute_satellite_position,
-    compute_pcc
-)
+# Package-level name -> submodule that defines it
+_EXPORTS = {
+    'read_antex_file': 'data_io',
+    'download_and_unzip_broadcast_file': 'data_io',
+    'read_broadcast_file': 'data_io',
+    'download_final_orbit_file': 'data_io',
+    'read_final_orbit_file': 'data_io',
+    'ell_to_ecef': 'geodesy',
+    'ecef_to_topocentric': 'geodesy',
+    'compute_satellite_position': 'geodesy',
+    'compute_pcc': 'geodesy',
+    'datetime_to_mjd': 'time_utils',
+    'mjd_to_gps_week': 'time_utils',
+    'datetime_to_gps_sow': 'time_utils',
+    'perform_adjustment': 'adjustment',
+    'compute_m_matrix': 'adjustment',
+    'run_processing_pipeline': 'processing_core',
+    'run_timeline_pipeline': 'processing_core',
+    'plot_results_bar_chart': 'plotting',
+    'plot_world_map': 'plotting',
+    'plot_skyplot': 'plotting',
+    'plot_timeline': 'plotting',
+}
 
-from .time_utils import (
-    datetime_to_mjd,
-    mjd_to_gps_week,
-    datetime_to_gps_sow
-)
+__all__ = sorted(_EXPORTS)
 
-from .adjustment import (
-    perform_adjustment,
-    compute_m_matrix
-)
 
-from .processing_core import (
-    run_processing_pipeline,
-    run_timeline_pipeline
-)
+def __getattr__(name):
+    module = _EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(f".{module}", __name__), name)
+    globals()[name] = value
+    return value
 
-from .plotting import (
-    plot_results_bar_chart,
-    plot_world_map,
-    plot_skyplot,
-    plot_timeline
-)
+
+def __dir__():
+    return sorted(set(globals()) | set(_EXPORTS))
+
 
 print("DPCC Analysis Package initialized.")

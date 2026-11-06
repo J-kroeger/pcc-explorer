@@ -377,7 +377,12 @@ class App(ttk.Window):
         scrollable_frame = ttk.Frame(canvas)
 
         scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        scroll_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        # Keep the content as wide as the visible canvas. Without this the frame
+        # keeps its requested width, and with larger system fonts the right part
+        # of the right column lies outside the window; with it, the expandable
+        # fields of the right column shrink instead.
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(scroll_window, width=e.width))
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
@@ -430,7 +435,8 @@ class App(ttk.Window):
         insights_frame = ttk.LabelFrame(right_column, text="Analysis Insights", padding=10)
         insights_frame.pack(pady=10, fill="x")
         self.insights_text = tk.StringVar()
-        self.insights_label = ttk.Label(insights_frame, textvariable=self.insights_text, wraplength=450, justify="left")
+        # 380 px fits the right column of a 1200 px window with larger system fonts.
+        self.insights_label = ttk.Label(insights_frame, textvariable=self.insights_text, wraplength=380, justify="left")
         self.insights_label.pack(fill="x")
 
         self._create_model_selection_widgets(right_column)
@@ -852,6 +858,40 @@ class App(ttk.Window):
         self.orbit_rb_final = ttk.Radiobutton(self.orbit_frame, text="Final Orbits (Precise)", variable=self.orbit_type_var, value="final")
         self.orbit_rb_final.pack(anchor="w")
 
+        # Local orbit files: for networks without internet access. The radio
+        # buttons above then only choose which kind is tried first.
+        self.use_local_orbits_var = tk.BooleanVar(value=False)
+        self.local_orbit_dir_var = tk.StringVar(value="")
+        self.local_orbits_cb = ttk.Checkbutton(
+            self.orbit_frame, text="Use local orbit files (no download)",
+            variable=self.use_local_orbits_var, command=self._on_local_orbits_toggle)
+        self.local_orbits_cb.pack(anchor="w", pady=(6, 0))
+        local_row = ttk.Frame(self.orbit_frame)
+        local_row.pack(fill="x", pady=(2, 0))
+        # Button packed first, so a narrow panel shortens the entry, not the button.
+        self.local_orbit_browse = ttk.Button(local_row, text="Browse...",
+                                             command=self._browse_local_orbit_dir,
+                                             bootstyle="outline-primary")
+        self.local_orbit_browse.pack(side="right")
+        self.local_orbit_entry = ttk.Entry(local_row, textvariable=self.local_orbit_dir_var, width=20)
+        self.local_orbit_entry.pack(side="left", fill="x", expand=True, padx=(18, 5))
+        # Wrapped to a fixed width so the hint cannot widen the panel.
+        self.local_orbit_hint = ttk.Label(
+            self.orbit_frame,
+            text=("SP3 or RINEX navigation files (versions 2-4, also .gz). Standard IGS "
+                  "names are found first, other names by their content. Navigation files "
+                  "serve GPS and Galileo. No server is contacted."),
+            foreground="gray", font=("Helvetica", 8), justify="left", wraplength=280)
+        self.local_orbit_hint.pack(anchor="w", fill="x", padx=(18, 0))
+        CreateToolTip(self.local_orbits_cb,
+                "Read the orbits from a folder instead of downloading them.\n"
+                "Final Orbits: an SP3 file is tried first, then a navigation file.\n"
+                "Broadcast Ephemeris: a navigation file is tried first, then SP3.\n"
+                "VMF grids and map imagery are not downloaded in this mode either.")
+        self.use_local_orbits_var.trace_add("write", self._update_insights)
+        self.local_orbit_dir_var.trace_add("write", self._update_insights)
+        self._on_local_orbits_toggle()
+
         # --- Computation Mode (v1.1: Line-of-Sight) ---
         comp_frame = ttk.LabelFrame(parent, text="Computation Mode", padding=10)
         comp_frame.pack(pady=10, fill="x")
@@ -992,7 +1032,7 @@ class App(ttk.Window):
         self.signal_container = self.signal_scroll_frame.scrollable_frame
         
         # Explanatory text for filtering behavior and signal types
-        self.signal_info_label = ttk.Label(freq_frame, text="Legend: G=GPS, R=GLONASS, E=Galileo, C=BDS. Showing available signals.", foreground="gray", font=("Helvetica", 8), wraplength=500)
+        self.signal_info_label = ttk.Label(freq_frame, text="Legend: G=GPS, R=GLONASS, E=Galileo, C=BDS. Showing available signals.", foreground="gray", font=("Helvetica", 8), wraplength=380)
         self.signal_info_label.pack(anchor="w", pady=(5,0))
 
         tropo_frame = ttk.LabelFrame(parent, text="Troposphere Mapping Function", padding=10)
@@ -1206,7 +1246,20 @@ class App(ttk.Window):
             except (ValueError, AttributeError):
                 pass
             
-            if orbit_type == 'final':
+            if hasattr(self, 'use_local_orbits_var') and self.use_local_orbits_var.get():
+                folder = self.local_orbit_dir_var.get().strip()
+                first = "an SP3 file" if orbit_type == 'final' else "a navigation file"
+                if not folder:
+                    message += "⚠️ Local orbit files: select the folder that holds the orbit files."
+                    style = "warning"
+                elif not os.path.isdir(folder):
+                    message += f"⚠️ Local orbit folder not found: {folder}"
+                    style = "warning"
+                else:
+                    message += (f"✅ Local orbit files: {first} for this day is looked for first in the "
+                                f"selected folder. No server is contacted.")
+                    if style != "warning": style = "success"
+            elif orbit_type == 'final':
                 cutoff_days = ConfigValidator.FINAL_ORBIT_DELAY_DAYS
                 time_delta = datetime.now() - selected_date
                 if time_delta.days < cutoff_days:
@@ -1216,11 +1269,10 @@ class App(ttk.Window):
                     # the user to pick another date.
                     message += (f"ℹ️ NOTE: Precise orbits appear about {cutoff_days} days after the day, "
                                 f"so they may not exist yet for this date (older than {cutoff_date} is safe).\n\n")
-                    # ... but only for a GPS-only run. The broadcast
-                    # reader skips every non-GPS record, so promising the
-                    # substitution here contradicted the refusal the pipeline
-                    # then raised ("this run needs E") - and the panel had said
-                    # "All inputs look valid" a moment earlier.
+                    # ... but only for a run restricted to GPS and Galileo,
+                    # the systems the broadcast reader evaluates. Promising the
+                    # substitution for other systems would contradict the
+                    # refusal the pipeline then raises.
                     selected = self._selected_signal_codes()
                     if not selected or ConfigValidator.broadcast_can_serve(
                             {'signals': selected}):
@@ -1228,9 +1280,9 @@ class App(ttk.Window):
                                     f"is missing, satellite geometry is unaffected.")
                         if style != "warning": style = "info"
                     else:
-                        message += (f"Broadcast ephemeris cannot stand in here: it supports GPS only, and "
-                                    f"this run needs another constellation. Pick a date older than "
-                                    f"{cutoff_date}, or a GPS signal.")
+                        message += (f"Broadcast ephemeris cannot stand in here: it supports GPS and Galileo "
+                                    f"only, and this run needs another constellation. Pick a date older than "
+                                    f"{cutoff_date}, or a GPS or Galileo signal.")
                         style = "warning"
                 else:
                     message += f"✅ Final Orbits selected. Date is suitable for precise data."
@@ -1564,7 +1616,8 @@ class App(ttk.Window):
                     plot_trajectory_map(
                         request['kin_data'], request['epoch_results'],
                         request['param_names'],
-                        antenna_name=request.get('antenna_name', '')
+                        antenna_name=request.get('antenna_name', ''),
+                        offline=request.get('offline', False)
                     )
                 else:
                     print(f"  Warning: unknown queued plot '{request.get('kind')}'.")
@@ -1595,6 +1648,21 @@ class App(ttk.Window):
         except Exception:
             pass  # Never let a label block the GUI from building
         self.masker_folder_label.config(text=saved if saved else "(auto-detect)")
+
+    def _on_local_orbits_toggle(self):
+        """Enable the orbit folder field only while local orbit files are used."""
+        state = "normal" if self.use_local_orbits_var.get() else "disabled"
+        self.local_orbit_entry.configure(state=state)
+        self.local_orbit_browse.configure(state=state)
+
+    def _browse_local_orbit_dir(self):
+        """Select the folder that holds the local orbit files."""
+        initial = self.local_orbit_dir_var.get().strip()
+        folder = filedialog.askdirectory(
+            title="Select the folder with the orbit files (SP3 or RINEX navigation)",
+            initialdir=initial if initial and os.path.isdir(initial) else None)
+        if folder:
+            self.local_orbit_dir_var.set(os.path.normpath(folder))
 
     def _browse_masker_folder(self):
         """Let the user point at their RINEX-Masker installation."""
@@ -2199,6 +2267,8 @@ class App(ttk.Window):
                 'sampling_rate_sec': int(self.samplerate_var.get()),
                 'interval_min': interval_minutes, 
                 'orbit_dir': os.path.join(project_root, 'data', 'orbit'),
+                'use_local_orbits': self.use_local_orbits_var.get(),
+                'local_orbit_dir': self.local_orbit_dir_var.get().strip(),
                 'elevation_mask_active': self.elevation_mask_var.get(),
                 'azimuth_mask_active': self.azimuth_mask_var.get(),
                 'azimuth_mask_values': self.azimuth_masks_list.copy(),
@@ -2450,7 +2520,15 @@ class App(ttk.Window):
         # --- Orbit Directory ---
         orbit_frame = add_section(scrollable_frame, "Orbit Directory")
         entries['orbit_dir'] = add_field(orbit_frame, "orbit_dir:", self.orbit_dir.get() if hasattr(self, 'orbit_dir') else "data/orbit")
-        
+        entries['use_local_orbits'] = add_field(
+            orbit_frame, "use_local_orbits:",
+            "True" if getattr(self, 'use_local_orbits_var', None) and self.use_local_orbits_var.get() else "False")
+        entries['local_orbit_dir'] = add_field(
+            orbit_frame, "local_orbit_dir:",
+            self.local_orbit_dir_var.get() if hasattr(self, 'local_orbit_dir_var') else "")
+        ttk.Label(orbit_frame, text="use_local_orbits=True reads orbits from local_orbit_dir only (no download)",
+                  foreground="gray").pack(anchor="w")
+
         # --- Elevation Mask ---
         mask_frame = add_section(scrollable_frame, "Elevation Mask")
         # Get the actual elevation angle value (not the boolean checkbox state)
@@ -2555,7 +2633,9 @@ class App(ttk.Window):
                     f.write(f"height={entries['height'].get()}\n\n")
                     
                     f.write("# --- Orbit Directory ---\n")
-                    f.write(f"orbit_dir={entries['orbit_dir'].get()}\n\n")
+                    f.write(f"orbit_dir={entries['orbit_dir'].get()}\n")
+                    f.write(f"use_local_orbits={entries['use_local_orbits'].get().strip().lower() == 'true'}\n")
+                    f.write(f"local_orbit_dir={entries['local_orbit_dir'].get().strip()}\n\n")
                     
                     f.write("# --- Elevation Mask ---\n")
                     f.write(f"elevation_mask={entries['elevation_mask'].get()}\n")
@@ -2684,6 +2764,12 @@ class App(ttk.Window):
             if 'gradient_active' in config: self.gradient_var.set(config['gradient_active'])
             if 'weighting' in config: self.weight_var.set(config['weighting'])
             if 'orbit_dir' in config and hasattr(self, 'orbit_dir'): self.orbit_dir.set(config['orbit_dir'])
+            if 'local_orbit_dir' in config: self.local_orbit_dir_var.set(config['local_orbit_dir'])
+            if 'use_local_orbits' in config:
+                value = config['use_local_orbits']
+                self.use_local_orbits_var.set(value if isinstance(value, bool)
+                                              else str(value).strip().lower() == 'true')
+                self._on_local_orbits_toggle()
         except Exception as e:
             print(f"Warning: Error loading processing options: {e}")
             
@@ -2975,7 +3061,15 @@ class App(ttk.Window):
         if label != 'global':
              valid, err = ConfigValidator.validate_config(config, val_mode)
              if not valid: messagebox.showerror("Error", err); return
-        def task(cb): return analysis_func(config, cb)
+        # The pipeline catches its own errors and reports them only through the
+        # progress callback ("Error: ..."); keep the text so it can be shown.
+        last_error = {}
+        def task(cb):
+            def tracking_cb(current, total, message=""):
+                if isinstance(message, str) and message.startswith("Error: "):
+                    last_error['msg'] = message[len("Error: "):]
+                return cb(current, total, message)
+            return analysis_func(config, tracking_cb)
         def complete(res):
             self.title("PCC-Explorer")
             # Figures the analysis wanted to draw are built HERE, on the
@@ -2987,6 +3081,12 @@ class App(ttk.Window):
             if label == 'single':
                 # Unpack 7 values (epoch_results is new for LoS per-epoch dropdown)
                 r, p, M, az, el, sat_ids, epoch_results = res
+                if r is None:
+                    messagebox.showerror(
+                        "Analysis Failed",
+                        last_error.get('msg', "The analysis returned no results.\n"
+                                              "See the console window for details."))
+                    return
                 if r is not None:
                     self.analysis_results = {"m_matrix": M, "azimuth": az, "elevation": el, "satellite_ids": sat_ids}
 

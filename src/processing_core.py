@@ -22,6 +22,7 @@ from .obstruction_mask import load_obstruction_mask
 from .los_adjustment import (parse_satellite_observations, perform_los_adjustment,
                               parse_att_file, parse_kin_file, merge_kinematic_data)
 from .rinex_bridge import rinex_to_los_observations, check_rinex_masker_available
+from .local_orbits import BROADCAST_SYSTEMS, find_orbit_file
 from .orbit_utils import interpolate_orbit
 from .time_utils import datetime_to_gps_sow
 from .geodesy import ell_to_ecef  # Needed for global analysis loop
@@ -69,6 +70,9 @@ def load_orbit_data(config: dict) -> dict:
     ~20 000 km is about 1e-5 deg - orders of magnitude below anything a PCC grid
     resolves. The substitution is announced and recorded in the saved config so
     a run always says which product it used.
+
+    With ``use_local_orbits`` set, the orbits come from the folder
+    ``local_orbit_dir`` only and no server is contacted.
     """
     orbit_time = config['start_time']
     orbit_type = config.get('orbit_type', 'final')
@@ -77,12 +81,15 @@ def load_orbit_data(config: dict) -> dict:
     orbit_data = None
     used = orbit_type
 
-    # The broadcast reader is GPS-only ("ephemeris propagator is GPS-only" in
-    # read_broadcast_file), so it can only stand in for a GPS-only run. Falling
-    # back for a Galileo or GLONASS analysis would hand the adjustment an empty
-    # sky rather than an error - worse than the failure it replaces.
+    # Broadcast ephemerides are evaluated for GPS and Galileo only, so they can
+    # stand in only for runs restricted to those systems. Falling back for a
+    # GLONASS or BeiDou analysis would hand the adjustment an empty sky rather
+    # than an error - worse than the failure it replaces.
     wanted = requested_constellations(config)
-    broadcast_can_serve = bool(wanted) and wanted <= {'G'}
+    broadcast_can_serve = bool(wanted) and wanted <= BROADCAST_SYSTEMS
+
+    if config.get('use_local_orbits'):
+        return _load_local_orbit_data(config, wanted)
 
     def _no_precise(reason):
         if broadcast_can_serve:
@@ -90,12 +97,12 @@ def load_orbit_data(config: dict) -> dict:
             print("  Using broadcast ephemeris instead - satellite geometry is "
                   "unaffected (metre-level orbit error is ~1e-5 deg in direction).")
             return
-        others = (', '.join(sorted(wanted - {'G'})) if wanted
+        others = (', '.join(sorted(wanted - BROADCAST_SYSTEMS)) if wanted
                   else 'constellations that could not be determined from the selected signals')
         raise ConnectionError(
             f"{reason}\n\n"
             f"Broadcast ephemeris cannot be used here: this run needs {others}, "
-            f"and the broadcast reader supports GPS only.\n"
+            f"and the broadcast reader supports GPS and Galileo only.\n"
             f"Choose a date at least {PRECISE_SAFE_AGE_DAYS} days in the past, "
             f"where precise multi-GNSS orbits are published."
         )
@@ -128,6 +135,64 @@ def load_orbit_data(config: dict) -> dict:
             f"one day in the past."
         )
 
+    config['_orbit_source_used'] = used
+    print(f"  Orbit source used: {used}")
+    return orbit_data
+
+
+def _load_local_orbit_data(config: dict, wanted: set) -> dict:
+    """
+    Orbit data from the user's local orbit folder, without any network access.
+
+    The folder search tries standard IGS file names first and reads other files
+    only when no standard name fits (see local_orbits.find_orbit_file). The
+    radio button decides which kind is preferred: Final Orbits looks for SP3
+    first, Broadcast Ephemeris for a navigation file first; the other kind is
+    used when the preferred one is missing, and the log says so.
+    """
+    folder = (config.get('local_orbit_dir') or '').strip()
+    orbit_time = config['start_time']
+    prefer = 'broadcast' if config.get('orbit_type') == 'broadcast' else 'precise'
+
+    if not folder or not os.path.isdir(folder):
+        raise FileNotFoundError(
+            f"Local orbit folder not found: '{folder}'.\n\n"
+            f"Select the folder that holds the orbit files, or switch off "
+            f"'Use local orbit files'.")
+
+    print(f"\n  Local orbit files: searching {folder} for {orbit_time.date()} "
+          f"(no download).")
+    found = find_orbit_file(folder, orbit_time, wanted, prefer,
+                            until=config.get('end_time'))
+    info = found.match
+    if info is None:
+        raise FileNotFoundError(found.failure_message(orbit_time, wanted, prefer))
+
+    how = 'standard file name' if info.found_by == 'name' else 'file content'
+    label = 'SP3' if info.kind == 'sp3' else f"RINEX {info.version} navigation"
+    print(f"  Using {info.name} ({label}, found by {how}; "
+          f"{len(found.opened)} file(s) opened).")
+
+    if info.kind == 'sp3':
+        orbit_data = read_final_orbit_file(info.path)
+        present = set(orbit_data.get('orbits', {}))
+        used = f"local precise (SP3): {info.name}"
+    else:
+        orbit_data = read_broadcast_file(info.path)
+        present = set(orbit_data)
+        used = f"local broadcast: {info.name}"
+
+    missing = set(wanted) - present
+    if not orbit_data or missing:
+        raise FileNotFoundError(
+            f"{info.name} holds no orbits for "
+            f"{', '.join(sorted(missing)) if missing else 'any system'}.\n\n"
+            f"Add an orbit file for {orbit_time.date()} that contains these "
+            f"systems to the folder {folder}.")
+
+    if (prefer == 'precise') != (info.kind == 'sp3'):
+        print(f"  Note: no {'SP3' if prefer == 'precise' else 'navigation'} file for "
+              f"this day in the folder; the {label} file is used instead.")
     config['_orbit_source_used'] = used
     print(f"  Orbit source used: {used}")
     return orbit_data
@@ -463,6 +528,8 @@ def run_processing_pipeline(config: dict, progress_callback=None) -> tuple:
                     bridge_result = rinex_to_los_observations(
                         rinex_path=rinex_obs_file,
                         sp3_path=config.get('rinex_sp3_file'),
+                        local_orbit_dir=(config.get('local_orbit_dir')
+                                         if config.get('use_local_orbits') else None),
                         station_xyz=config.get('rinex_station_xyz'),
                         sampling_interval=config.get('rinex_sampling_interval', 30.0),
                         elevation_mask=config.get('elevation_cutoff', 0.0),
@@ -537,6 +604,7 @@ def run_processing_pipeline(config: dict, progress_callback=None) -> tuple:
                     'epoch_results': epoch_results,
                     'param_names': param_names,
                     'antenna_name': config.get('antenna_type', ''),
+                    'offline': bool(config.get('use_local_orbits')),
                 }
                 if threading.current_thread() is threading.main_thread():
                     try:
@@ -544,7 +612,8 @@ def run_processing_pipeline(config: dict, progress_callback=None) -> tuple:
                         print("  Generating trajectory map...")
                         plot_trajectory_map(
                             kin_data, epoch_results, param_names,
-                            antenna_name=request['antenna_name']
+                            antenna_name=request['antenna_name'],
+                            offline=request['offline']
                         )
                     except Exception as e:
                         print(f"  Warning: Could not generate trajectory map: {e}")
@@ -583,9 +652,14 @@ def run_processing_pipeline(config: dict, progress_callback=None) -> tuple:
                         lat, lon = np.rad2deg(lat_r), np.rad2deg(lon_r)
                     vmf_dir = config.get('vmf_dir') or os.path.join(
                         os.path.dirname(config['orbit_dir']), 'vmf')
-                    aw = station_daily_aw(config['start_time'], lat, lon, vmf_dir)
+                    offline = bool(config.get('use_local_orbits'))
+                    aw = station_daily_aw(config['start_time'], lat, lon, vmf_dir,
+                                          allow_download=not offline)
                     config['vmf_aw'] = aw
-                    if aw is None:
+                    if aw is None and offline:
+                        print("  [VMF] local-files mode: no VMF grids in the cache for "
+                              "this day and no download; adjustment will fall back to GMF.")
+                    elif aw is None:
                         print("  [VMF] aw unavailable; adjustment will fall back to GMF.")
                 except Exception as exc:
                     print(f"  [VMF] coefficient lookup failed ({exc}); falling back to GMF.")

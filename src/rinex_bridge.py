@@ -372,6 +372,30 @@ def resolve_station_position(header_xyz, station_xyz=None, fallback_station_xyz=
     )
 
 
+def _load_local_orbit_table(folder: str, when: datetime, systems: list = None) -> dict:
+    """
+    Orbit table for the observation day from the local orbit folder, in the
+    SP3 structure RINEX-Masker's satellite_position module expects. An SP3 file
+    is preferred; a navigation file serves GPS and Galileo.
+    """
+    try:
+        from . import local_orbits
+    except ImportError:  # run as a script
+        import local_orbits
+
+    if not folder or not os.path.isdir(folder):
+        raise FileNotFoundError(f"Local orbit folder not found: '{folder}'.")
+    wanted = set(systems) if systems else set()
+    found = local_orbits.find_orbit_file(folder, when, wanted, prefer='precise')
+    info = found.match
+    if info is None:
+        raise FileNotFoundError(found.failure_message(when, wanted, 'precise'))
+    how = 'standard file name' if info.found_by == 'name' else 'file content'
+    print(f"  Local orbit file: {info.name} "
+          f"({'SP3' if info.kind == 'sp3' else 'RINEX navigation'}, found by {how})")
+    return local_orbits.load_orbit_table(info, when.date())
+
+
 def rinex_to_los_observations(
     rinex_path: str,
     sp3_path: str = None,
@@ -383,6 +407,7 @@ def rinex_to_los_observations(
     progress_callback=None,
     kin_path: str = None,
     fallback_station_xyz: list = None,
+    local_orbit_dir: str = None,
 ) -> dict:
     """
     Convert a RINEX observation file into PCC-Explorer LoS observations.
@@ -394,6 +419,9 @@ def rinex_to_los_observations(
     Args:
         rinex_path: Path to the RINEX observation file (.RNX, .26O, etc.)
         sp3_path: Path to SP3 orbit file. If None, auto-downloads from AIUB FTP.
+        local_orbit_dir: Folder of local orbit files (SP3 or RINEX navigation).
+                         When given, the orbits come from this folder only and
+                         nothing is downloaded; sp3_path is then ignored.
         station_xyz: [X, Y, Z] ECEF station position in meters.
                      If None, uses APPROX POSITION XYZ from RINEX header.
                      Ignored per epoch when kin_path is given and covers it.
@@ -474,7 +502,9 @@ def rinex_to_los_observations(
         progress_callback(15, "Loading SP3 orbits...")
 
     # --- Load SP3 orbits ---
-    if sp3_path and os.path.exists(sp3_path):
+    if local_orbit_dir:
+        sp3_data = _load_local_orbit_table(local_orbit_dir, rinex_date, systems)
+    elif sp3_path and os.path.exists(sp3_path):
         sp3_data = sat_pos_module.read_sp3(sp3_path)
     else:
         # Auto-download: use PCC-Explorer's orbit directory
@@ -698,6 +728,9 @@ if __name__ == '__main__':
     )
     parser.add_argument('rinex', help='Path to RINEX observation file')
     parser.add_argument('--sp3', help='Path to SP3 orbit file (auto-download if omitted)')
+    parser.add_argument('--orbit-folder',
+                        help='Folder of local orbit files (SP3 or RINEX navigation); '
+                             'nothing is downloaded')
     parser.add_argument('--sampling', type=float, default=30.0,
                         help='Sampling interval in seconds (default: 30)')
     parser.add_argument('--elevation-mask', type=float, default=0.0,
@@ -711,6 +744,7 @@ if __name__ == '__main__':
     result = rinex_to_los_observations(
         rinex_path=args.rinex,
         sp3_path=args.sp3,
+        local_orbit_dir=args.orbit_folder,
         sampling_interval=args.sampling,
         elevation_mask=args.elevation_mask,
         systems=args.systems,

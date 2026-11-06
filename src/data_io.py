@@ -21,6 +21,7 @@ import numpy as np
 import requests
 
 from .ephemeris_parser import read_ephemeris_records
+from .local_orbits import open_text, read_nav_file
 from .time_utils import datetime_to_mjd, mjd_to_gps_week
 
 
@@ -966,111 +967,30 @@ def read_antex_file(filename: str) -> dict:
 
 def read_broadcast_file(filename: str) -> dict:
     """
-    Reads a RINEX v2/v3 broadcast navigation file and returns ephemeris data.
+    Reads a RINEX 2, 3 or 4 broadcast navigation file (plain or .gz) and
+    returns the GPS and Galileo ephemerides.
+
+    Returns:
+        {system: {prn: [record, ...]}} with system 'G' and/or 'E'. Each record
+        carries 'epoch', 'system' and the Keplerian parameters. Other systems
+        in a mixed file are skipped record by record.
     """
-    broadcast_data = {}
     print(f"\nParsing broadcast file: {filename}")
     if not os.path.exists(filename):
         print(f"ERROR: Broadcast file does not exist: {filename}")
         return {}
     try:
-        for encoding in ['ascii', 'utf-8', 'latin-1']:
-            try:
-                with open(filename, 'r', encoding=encoding, errors='ignore') as f:
-                    lines = f.readlines()
-                break
-            except UnicodeDecodeError:
-                continue
-        else:
-            print("ERROR: Could not read file with any supported encoding")
-            return {}
-
-        header_end_index = 0
-        for idx, line in enumerate(lines):
-            if "END OF HEADER" in line:
-                header_end_index = idx + 1
-                break
-        if header_end_index == 0:
-            print("ERROR: 'END OF HEADER' not found in file")
-            return {}
-
-        # Detect RINEX version from header
-        rinex_version = 2
-        for line in lines[:header_end_index]:
-            if 'RINEX VERSION' in line:
-                try:
-                    ver = float(line[:9].strip())
-                    if ver >= 3.0:
-                        rinex_version = 3
-                except ValueError:
-                    pass
-                break
-
-        lines_to_parse = lines[header_end_index:]
-        records_parsed = 0
-        i = 0
-        while i < len(lines_to_parse):
-            line = lines_to_parse[i]
-            if not line.strip():
-                i += 1
-                continue
-            try:
-                if rinex_version >= 3:
-                    # RINEX v3: First char is system (G/R/E/C/J/S), then 2-digit PRN
-                    sys_char = line[0].upper()
-                    if sys_char not in ('G', 'R', 'E', 'C', 'J', 'S'):
-                        i += 1
-                        continue
-                    try:
-                        prn = int(line[1:3].strip())
-                    except ValueError:
-                        i += 1
-                        continue
-                    system = sys_char
-                    # Only process GPS for now (ephemeris propagator is GPS-only)
-                    if system != 'G':
-                        i += 8  # Skip non-GPS records (8 lines per record)
-                        continue
-                    if prn < 1 or prn > 32:
-                        i += 1
-                        continue
-                else:
-                    # RINEX v2: Plain PRN number, GPS only
-                    try:
-                        prn_str = line[0:3].strip()
-                        prn = int(prn_str)
-                    except ValueError:
-                        i += 1
-                        continue
-                    system = 'G'
-                    if prn < 1 or prn > 32:
-                        i += 1
-                        continue
-
-                if i + 8 > len(lines_to_parse):
-                    break
-                record_lines = lines_to_parse[i: i + 8]
-                
-                try:
-                    epoch, params = read_ephemeris_records(record_lines)
-                    if system not in broadcast_data:
-                        broadcast_data[system] = {}
-                    if prn not in broadcast_data[system]:
-                        broadcast_data[system][prn] = []
-                    broadcast_data[system][prn].append({'epoch': epoch, **params})
-                    records_parsed += 1
-                except Exception:
-                    pass
-                i += 8
-            except (ValueError, IndexError):
-                i += 1
-                continue
-
-        print(f"[OK] Successfully parsed {records_parsed} ephemeris records")
-        return broadcast_data
+        broadcast_data = read_nav_file(filename)
     except Exception as e:
         print(f"Error in read_broadcast_file: {e}")
         return {}
+    names = {'G': 'GPS', 'E': 'Galileo'}
+    counts = {s: sum(len(r) for r in sats.values()) for s, sats in broadcast_data.items()}
+    total = sum(counts.values())
+    detail = ', '.join(f"{names.get(s, s)} {counts[s]}" for s in ('G', 'E') if s in counts)
+    print(f"[OK] Successfully parsed {total} ephemeris records"
+          + (f" ({detail})" if detail else ""))
+    return broadcast_data
 
 
 # ----------------------------
@@ -1082,7 +1002,7 @@ def read_final_orbit_file(filename: str) -> dict:
     Reads an SP3 precise orbit file and returns satellite positions.
 
     Args:
-        filename: Path to the SP3 (.sp3) orbit file.
+        filename: Path to the SP3 (.sp3) orbit file, plain or .gz.
 
     Returns:
         dict with key 'orbits' mapping system chars to PRN dicts,
@@ -1090,7 +1010,7 @@ def read_final_orbit_file(filename: str) -> dict:
     """
     orbit_data = {}
     current_epoch = None
-    with open(filename, 'r') as f:
+    with open_text(filename) as f:
         for line in f:
             if line.startswith('*'):
                 try:
@@ -1188,7 +1108,7 @@ def read_config_file(filepath: str) -> dict:
                 if key in ['start_date', 'end_date', 'start_time', 'end_time']:
                     config[key] = value
                 elif key in ['elevation_mask_active', 'azimuth_mask_active', 'gradient_active',
-                             'obstruction_mask_active']:
+                             'obstruction_mask_active', 'use_local_orbits']:
                     config[key] = value.lower() == 'true'
                 elif key in ['latitude', 'longitude', 'height', 'elevation_mask_angle', 'lat_min', 'lat_max', 'lon_min', 'lon_max', 'global_grid_step']:
                     config[key] = float(value) if value else 0.0

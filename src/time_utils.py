@@ -5,12 +5,18 @@ GPS/UTC time conversion utilities.
 
 import math
 from datetime import datetime
-from astropy.time import Time
+
+#: MJD 0 = 1858-11-17 00:00.
+MJD_EPOCH = datetime(1858, 11, 17)
+
 
 def datetime_to_mjd(dt_obj: datetime) -> float:
     """
-    Converts a Python datetime object to Modified Julian Date (MJD)
-    using the professional astropy library for guaranteed accuracy.
+    Converts a Python datetime object to Modified Julian Date (MJD).
+
+    Plain day counting from MJD 0, without leap seconds, which is what GPS
+    time needs. The day number is exact; within a UTC leap-second day the
+    fraction can differ from a UTC-scale conversion by up to one second.
 
     Args:
         dt_obj: The datetime object to convert.
@@ -18,9 +24,7 @@ def datetime_to_mjd(dt_obj: datetime) -> float:
     Returns:
         The Modified Julian Date as a float.
     """
-    # Use astropy's Time object for a robust and correct conversion
-    t = Time(dt_obj, scale='utc')
-    return t.mjd
+    return (dt_obj - MJD_EPOCH).total_seconds() / 86400.0
 
 
 def mjd_to_gps_week(mjd: float) -> tuple:
