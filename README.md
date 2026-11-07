@@ -284,7 +284,7 @@ PCC-Explorer/
 ---
 
 ## Contact
-Dr.-Ing. Johannes Kröger – <kroeger@ife.uni-hannover.de>  
+Dr.-Ing. Johannes Kröger, <kroeger@ife.uni-hannover.de>  
 
 ---
 
